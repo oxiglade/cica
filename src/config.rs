@@ -38,7 +38,7 @@ pub fn paths() -> Result<Paths> {
 }
 
 impl Paths {
-    /// Create all necessary directories
+    /// Create all necessary directories and default files
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.base)?;
         std::fs::create_dir_all(&self.memory_dir)?;
@@ -46,6 +46,21 @@ impl Paths {
         std::fs::create_dir_all(&self.bin_dir)?;
         std::fs::create_dir_all(&self.claude_code_dir)?;
         std::fs::create_dir_all(&self.claude_home)?;
+
+        // Create default PERSONA.md if it doesn't exist
+        let persona_path = self.base.join("PERSONA.md");
+        if !persona_path.exists() {
+            let content = r#"# PERSONA.md - Persona & Boundaries
+
+Describe who the assistant is, tone, and boundaries.
+
+- Keep replies concise and direct.
+- Ask clarifying questions when needed.
+- Never send streaming/partial replies to external messaging surfaces.
+"#;
+            std::fs::write(&persona_path, content)?;
+        }
+
         Ok(())
     }
 }

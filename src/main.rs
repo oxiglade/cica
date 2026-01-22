@@ -2,6 +2,7 @@ mod channels;
 mod claude;
 mod cmd;
 mod config;
+mod onboarding;
 mod pairing;
 mod setup;
 

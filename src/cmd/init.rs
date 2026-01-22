@@ -165,9 +165,7 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
                 config.claude.api_key = Some(env_token);
                 config.save()?;
 
-                // Create example files
                 let paths = config::paths()?;
-                create_example_files(&paths)?;
 
                 println!();
                 println!("Setup complete!");
@@ -251,9 +249,7 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
     config.claude.api_key = Some(credential);
     config.save()?;
 
-    // Create example files
     let paths = config::paths()?;
-    create_example_files(&paths)?;
 
     println!();
     println!("Setup complete!");
@@ -263,65 +259,5 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
     println!("Run `cica` to start your assistant.");
 
     info!("Claude setup complete");
-    Ok(())
-}
-
-/// Create example memory and skill files
-fn create_example_files(paths: &config::Paths) -> Result<()> {
-    // Example memory
-    let memory_example = paths.memory_dir.join("example.md");
-    if !memory_example.exists() {
-        let content = r#"# Example Memory
-
-This is an example memory file. You can delete it.
-
-## How Memory Works
-
-Memory files are topical markdown files. When you chat with Cica,
-relevant memories are retrieved and included as context.
-
-## Examples
-
-- `devenv.md` - Notes on how to use devenv in your projects
-- `work.md` - Context about your job, team, projects
-- `rust.md` - Your preferred Rust patterns and crates
-- `me.md` - Personal info you want the assistant to know
-
-## Format
-
-Just write naturally. The filename becomes the topic identifier.
-You can edit these files directly - Cica reads them as-is.
-"#;
-        std::fs::write(&memory_example, content)?;
-    }
-
-    // Example skill
-    let skill_dir = paths.skills_dir.join("example");
-    let skill_md = skill_dir.join("skill.md");
-    if !skill_md.exists() {
-        std::fs::create_dir_all(&skill_dir)?;
-
-        let content = r#"# Example Skill
-
-This is an example skill. You can delete this folder.
-
-## Description
-
-Skills are folders containing:
-- `skill.md` - This file, describing what the skill does
-- Scripts (`.py`, `.js`, `.rhai`) - The actual implementation
-
-## When to Use
-
-Describe when the AI should invoke this skill.
-
-## Examples
-
-- "Run the example skill"
-- "Show me how skills work"
-"#;
-        std::fs::write(&skill_md, content)?;
-    }
-
     Ok(())
 }

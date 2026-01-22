@@ -4,6 +4,7 @@ use tracing::{info, warn};
 
 use crate::claude;
 use crate::config::TelegramConfig;
+use crate::onboarding;
 use crate::pairing::PairingStore;
 
 /// Validate a Telegram bot token by calling getMe
@@ -68,6 +69,20 @@ async fn handle_message(bot: &Bot, msg: &Message) -> Result<()> {
 
     info!("Message from {}: {}", user_id, text);
 
+    // Check if onboarding is complete
+    if !onboarding::is_complete()? {
+        // /start triggers onboarding greeting, not treated as an answer
+        let message = if text == "/start" { "hi" } else { text };
+        let response = handle_onboarding(message).await?;
+        bot.send_message(msg.chat.id, response).await?;
+        return Ok(());
+    }
+
+    // Ignore /start after onboarding (already set up)
+    if text == "/start" {
+        return Ok(());
+    }
+
     // Query Claude
     let response = match claude::query(text).await {
         Ok(response) => response,
@@ -80,4 +95,18 @@ async fn handle_message(bot: &Bot, msg: &Message) -> Result<()> {
     bot.send_message(msg.chat.id, response).await?;
 
     Ok(())
+}
+
+/// Handle onboarding flow - Claude drives the conversation
+async fn handle_onboarding(message: &str) -> Result<String> {
+    let system_prompt = onboarding::system_prompt()?;
+
+    let options = claude::QueryOptions {
+        system_prompt: Some(system_prompt),
+        skip_permissions: true, // Allow writing IDENTITY.md
+        ..Default::default()
+    };
+
+    let (response, _) = claude::query_with_options(message, options).await?;
+    Ok(response)
 }
