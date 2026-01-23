@@ -1,5 +1,5 @@
+pub mod signal;
 pub mod telegram;
-
 
 /// Information about a channel for display purposes
 pub struct ChannelInfo {
@@ -13,7 +13,10 @@ pub const SUPPORTED_CHANNELS: &[ChannelInfo] = &[
         name: "telegram",
         display_name: "Telegram",
     },
-    // Future: discord, slack, etc.
+    ChannelInfo {
+        name: "signal",
+        display_name: "Signal",
+    },
 ];
 
 /// Get channel info by name

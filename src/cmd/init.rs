@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use tracing::info;
 
-use crate::channels::{self, telegram};
-use crate::config::{self, Config, TelegramConfig};
+use crate::channels::{self, signal, telegram};
+use crate::config::{self, Config, SignalConfig, TelegramConfig};
 use crate::setup;
 
 /// Run the init command
@@ -91,6 +91,7 @@ async fn add_channel(existing_config: Option<Config>) -> Result<Config> {
 
     match channel.name {
         "telegram" => setup_telegram(existing_config).await,
+        "signal" => setup_signal(existing_config).await,
         _ => bail!("Channel not yet supported: {}", channel.name),
     }
 }
@@ -129,6 +130,86 @@ async fn setup_telegram(existing_config: Option<Config>) -> Result<Config> {
     config.save()?;
 
     info!("Telegram setup complete");
+    Ok(config)
+}
+
+/// Set up Signal
+async fn setup_signal(existing_config: Option<Config>) -> Result<Config> {
+    println!();
+    println!("Signal Setup");
+    println!("────────────");
+    println!();
+    println!("Signal requires a phone number that can receive SMS.");
+    println!("You'll need to verify it with a code sent via text message.");
+    println!();
+
+    // Download Java and signal-cli if needed
+    if setup::find_java().is_none() {
+        print!("Downloading Java runtime... ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        setup::ensure_java().await?;
+        println!("done");
+    }
+
+    if setup::find_signal_cli().is_none() {
+        print!("Downloading signal-cli... ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        setup::ensure_signal_cli().await?;
+        println!("done");
+    }
+
+    // Get phone number
+    let phone_number: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Phone number (with country code, e.g., +1234567890)")
+        .interact_text()?;
+
+    // Validate format
+    if !phone_number.starts_with('+') {
+        bail!("Phone number must start with + and country code (e.g., +1 for US)");
+    }
+
+    println!();
+    println!("Registering with Signal...");
+    println!("(You may need to complete a CAPTCHA in your browser)");
+    println!();
+
+    // Register
+    if let Err(e) = signal::register_account(&phone_number).await {
+        // Registration might fail if already registered, which is fine
+        println!("Note: {}", e);
+        println!("If already registered, you can proceed with verification.");
+    }
+
+    // Get verification code
+    let code: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter the verification code from SMS")
+        .interact_text()?;
+
+    // Remove any spaces/dashes from the code
+    let code = code.replace([' ', '-'], "");
+
+    print!("Verifying... ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    match signal::verify_account(&phone_number, &code).await {
+        Ok(()) => println!("OK"),
+        Err(e) => {
+            println!("FAILED");
+            bail!("Verification failed: {}", e);
+        }
+    }
+
+    // Build config
+    let mut config = existing_config.unwrap_or_default();
+    config.channels.signal = Some(SignalConfig {
+        phone_number: phone_number.clone(),
+    });
+    config.save()?;
+
+    println!();
+    println!("Signal setup complete for {}", phone_number);
+
+    info!("Signal setup complete");
     Ok(config)
 }
 

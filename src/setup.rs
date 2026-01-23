@@ -1,8 +1,7 @@
-//! Setup utilities for downloading and configuring Bun and Claude Code.
+//! Setup utilities for downloading and configuring Bun, Claude Code, Java, and signal-cli.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config;
 
@@ -212,6 +211,141 @@ fn validate_oauth_token(token: &str) -> Result<()> {
             SETUP_TOKEN_MIN_LENGTH
         );
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// Java (for signal-cli)
+// ============================================================================
+
+const SIGNAL_CLI_VERSION: &str = "0.13.12";
+
+fn java_download_url() -> Result<&'static str> {
+    // Eclipse Temurin JRE 21 from Adoptium
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok(
+            "https://api.adoptium.net/v3/binary/latest/21/ga/mac/aarch64/jre/hotspot/normal/eclipse",
+        ),
+        ("macos", "x86_64") => {
+            Ok("https://api.adoptium.net/v3/binary/latest/21/ga/mac/x64/jre/hotspot/normal/eclipse")
+        }
+        ("linux", "aarch64") => Ok(
+            "https://api.adoptium.net/v3/binary/latest/21/ga/linux/aarch64/jre/hotspot/normal/eclipse",
+        ),
+        ("linux", "x86_64") => Ok(
+            "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jre/hotspot/normal/eclipse",
+        ),
+        (os, arch) => bail!("Unsupported platform for Java: {}-{}", os, arch),
+    }
+}
+
+fn signal_cli_download_url() -> String {
+    format!(
+        "https://github.com/AsamK/signal-cli/releases/download/v{}/signal-cli-{}.tar.gz",
+        SIGNAL_CLI_VERSION, SIGNAL_CLI_VERSION
+    )
+}
+
+/// Check if Java is available (bundled only - we don't use system Java)
+pub fn find_java() -> Option<PathBuf> {
+    if let Ok(paths) = config::paths() {
+        // Look for java binary in java_dir/bin/java (or java_dir/*/bin/java for extracted structure)
+        let direct = paths.java_dir.join("bin").join("java");
+        if direct.exists() {
+            return Some(direct);
+        }
+
+        // Check for extracted JRE directory structure (e.g., jdk-21.0.1+12-jre/bin/java)
+        if let Ok(entries) = std::fs::read_dir(&paths.java_dir) {
+            for entry in entries.flatten() {
+                let java_path = entry.path().join("bin").join("java");
+                if java_path.exists() {
+                    return Some(java_path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Ensure Java is available, downloading if necessary
+pub async fn ensure_java() -> Result<PathBuf> {
+    if let Some(path) = find_java() {
+        return Ok(path);
+    }
+
+    let paths = config::paths()?;
+    std::fs::create_dir_all(&paths.java_dir)?;
+
+    let url = java_download_url()?;
+    download_and_extract_tarball(url, &paths.java_dir).await?;
+
+    find_java()
+        .ok_or_else(|| anyhow!("Java installation failed - binary not found after extraction"))
+}
+
+/// Check if signal-cli is available
+pub fn find_signal_cli() -> Option<PathBuf> {
+    if let Ok(paths) = config::paths() {
+        // Look for signal-cli script
+        let direct = paths.signal_cli_dir.join("bin").join("signal-cli");
+        if direct.exists() {
+            return Some(direct);
+        }
+
+        // Check for extracted directory structure (e.g., signal-cli-0.13.12/bin/signal-cli)
+        if let Ok(entries) = std::fs::read_dir(&paths.signal_cli_dir) {
+            for entry in entries.flatten() {
+                let cli_path = entry.path().join("bin").join("signal-cli");
+                if cli_path.exists() {
+                    return Some(cli_path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Ensure signal-cli is available, downloading if necessary
+pub async fn ensure_signal_cli() -> Result<PathBuf> {
+    if let Some(path) = find_signal_cli() {
+        return Ok(path);
+    }
+
+    let paths = config::paths()?;
+    std::fs::create_dir_all(&paths.signal_cli_dir)?;
+
+    let url = signal_cli_download_url();
+    download_and_extract_tarball(&url, &paths.signal_cli_dir).await?;
+
+    find_signal_cli().ok_or_else(|| {
+        anyhow!("signal-cli installation failed - binary not found after extraction")
+    })
+}
+
+/// Download and extract a tarball (.tar.gz)
+async fn download_and_extract_tarball(url: &str, dest_dir: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let response = reqwest::get(url)
+        .await
+        .with_context(|| format!("Failed to download from {}", url))?;
+
+    if !response.status().is_success() {
+        bail!("Failed to download: HTTP {}", response.status());
+    }
+
+    let bytes = response.bytes().await?;
+
+    // Extract tarball
+    let cursor = std::io::Cursor::new(bytes);
+    let gz = GzDecoder::new(cursor);
+    let mut archive = Archive::new(gz);
+    archive.unpack(dest_dir)?;
 
     Ok(())
 }

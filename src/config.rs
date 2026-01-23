@@ -16,7 +16,10 @@ pub struct Paths {
     pub skills_dir: PathBuf,
     pub bin_dir: PathBuf,
     pub claude_code_dir: PathBuf,
-    pub claude_home: PathBuf, // Isolated HOME for Claude Code
+    pub claude_home: PathBuf,     // Isolated HOME for Claude Code
+    pub java_dir: PathBuf,        // Bundled JRE for signal-cli
+    pub signal_cli_dir: PathBuf,  // signal-cli installation
+    pub signal_data_dir: PathBuf, // signal-cli account data
 }
 
 /// Get all Cica paths
@@ -33,6 +36,9 @@ pub fn paths() -> Result<Paths> {
         bin_dir: base.join("bin"),
         claude_code_dir: base.join("claude-code"),
         claude_home: base.join("claude-home"),
+        java_dir: base.join("java"),
+        signal_cli_dir: base.join("signal-cli"),
+        signal_data_dir: base.join("signal-data"),
         base,
     })
 }
@@ -100,13 +106,20 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
-    // Future: discord, slack, etc.
+    pub signal: Option<SignalConfig>,
 }
 
 /// Telegram-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
+}
+
+/// Signal-specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalConfig {
+    /// Phone number with country code (e.g., "+1234567890")
+    pub phone_number: String,
 }
 
 /// Claude configuration
@@ -156,6 +169,9 @@ impl Config {
 
         if self.channels.telegram.is_some() {
             channels.push("telegram");
+        }
+        if self.channels.signal.is_some() {
+            channels.push("signal");
         }
 
         channels

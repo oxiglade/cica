@@ -1,7 +1,7 @@
 use anyhow::Result;
-use tracing::info;
+use tracing::{error, info};
 
-use crate::channels::telegram;
+use crate::channels::{signal, telegram};
 use crate::config::Config;
 
 /// Run the assistant (default command)
@@ -24,10 +24,28 @@ pub async fn run() -> Result<()> {
 
     info!("Starting Cica with channels: {}", channels.join(", "));
 
-    // For now, we only support Telegram
-    // Future: spawn tasks for each channel
+    // Spawn tasks for each configured channel
+    let mut handles = Vec::new();
+
     if let Some(telegram_config) = config.channels.telegram {
-        telegram::run(telegram_config).await?;
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = telegram::run(telegram_config).await {
+                error!("Telegram channel error: {}", e);
+            }
+        }));
+    }
+
+    if let Some(signal_config) = config.channels.signal {
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = signal::run(signal_config).await {
+                error!("Signal channel error: {}", e);
+            }
+        }));
+    }
+
+    // Wait for all channels (they run forever unless they error)
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())
