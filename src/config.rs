@@ -14,12 +14,15 @@ pub struct Paths {
     pub pairing_file: PathBuf,
     pub memory_dir: PathBuf,
     pub skills_dir: PathBuf,
-    pub bin_dir: PathBuf,
+    // Internal paths (hidden from user)
+    pub internal_dir: PathBuf,
+    pub deps_dir: PathBuf,
+    pub bun_dir: PathBuf,
+    pub java_dir: PathBuf,
+    pub signal_cli_dir: PathBuf,
     pub claude_code_dir: PathBuf,
-    pub claude_home: PathBuf,     // Isolated HOME for Claude Code
-    pub java_dir: PathBuf,        // Bundled JRE for signal-cli
-    pub signal_cli_dir: PathBuf,  // signal-cli installation
-    pub signal_data_dir: PathBuf, // signal-cli account data
+    pub claude_home: PathBuf,
+    pub signal_data_dir: PathBuf,
 }
 
 /// Get all Cica paths
@@ -28,17 +31,23 @@ pub fn paths() -> Result<Paths> {
         .map(|dirs| dirs.config_dir().to_path_buf())
         .context("Could not determine config directory")?;
 
+    let internal_dir = base.join("internal");
+    let deps_dir = internal_dir.join("deps");
+
     Ok(Paths {
         config_file: base.join("config.toml"),
         pairing_file: base.join("pairing.json"),
         memory_dir: base.join("memory"),
         skills_dir: base.join("skills"),
-        bin_dir: base.join("bin"),
-        claude_code_dir: base.join("claude-code"),
-        claude_home: base.join("claude-home"),
-        java_dir: base.join("java"),
-        signal_cli_dir: base.join("signal-cli"),
-        signal_data_dir: base.join("signal-data"),
+        // Internal paths
+        internal_dir: internal_dir.clone(),
+        deps_dir: deps_dir.clone(),
+        bun_dir: deps_dir.join("bun"),
+        java_dir: deps_dir.join("java"),
+        signal_cli_dir: deps_dir.join("signal-cli"),
+        claude_code_dir: deps_dir.join("claude-code"),
+        claude_home: internal_dir.join("claude-home"),
+        signal_data_dir: internal_dir.join("signal-data"),
         base,
     })
 }
@@ -49,8 +58,7 @@ impl Paths {
         std::fs::create_dir_all(&self.base)?;
         std::fs::create_dir_all(&self.memory_dir)?;
         std::fs::create_dir_all(&self.skills_dir)?;
-        std::fs::create_dir_all(&self.bin_dir)?;
-        std::fs::create_dir_all(&self.claude_code_dir)?;
+        std::fs::create_dir_all(&self.deps_dir)?;
         std::fs::create_dir_all(&self.claude_home)?;
 
         // Create default PERSONA.md if it doesn't exist

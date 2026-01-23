@@ -178,9 +178,7 @@ pub fn build_context_prompt(channel: Option<&str>) -> Result<String> {
         .unwrap_or_else(|| "Cica".to_string());
 
     // Core identity with channel info
-    let channel_info = channel
-        .map(|c| format!(" (via {})", c))
-        .unwrap_or_default();
+    let channel_info = channel.map(|c| format!(" (via {})", c)).unwrap_or_default();
     lines.push(format!(
         "You are {}, a personal AI assistant. You are chatting with your user via a messaging app{}.",
         assistant_name, channel_info
@@ -200,8 +198,14 @@ pub fn build_context_prompt(channel: Option<&str>) -> Result<String> {
     // Channel-specific guidance
     if let Some(channel_name) = channel {
         lines.push("## Messaging Channel".to_string());
-        lines.push(format!("You are currently communicating via {}.", channel_name));
-        lines.push("IMPORTANT: Never send streaming/partial replies to external messaging surfaces.".to_string());
+        lines.push(format!(
+            "You are currently communicating via {}.",
+            channel_name
+        ));
+        lines.push(
+            "IMPORTANT: Never send streaming/partial replies to external messaging surfaces."
+                .to_string(),
+        );
         lines.push(String::new());
     }
 
@@ -213,7 +217,7 @@ pub fn build_context_prompt(channel: Option<&str>) -> Result<String> {
     lines.push(String::new());
     lines.push(format!(
         "When building skills, prefer TypeScript/JavaScript and use the bundled Bun at: {}",
-        paths.bin_dir.join("bun").display()
+        paths.bun_dir.join("bun").display()
     ));
     lines.push(String::new());
 

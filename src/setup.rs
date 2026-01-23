@@ -32,7 +32,7 @@ pub fn find_bun() -> Option<PathBuf> {
 
     // Check our bundled bun
     if let Ok(paths) = config::paths() {
-        let bundled = paths.bin_dir.join("bun");
+        let bundled = paths.bun_dir.join("bun");
         if bundled.exists() {
             return Some(bundled);
         }
@@ -50,12 +50,12 @@ pub async fn ensure_bun() -> Result<PathBuf> {
 
     // Need to download
     let paths = config::paths()?;
-    std::fs::create_dir_all(&paths.bin_dir)?;
+    std::fs::create_dir_all(&paths.bun_dir)?;
 
     let url = bun_download_url()?;
-    let bun_path = paths.bin_dir.join("bun");
+    let bun_path = paths.bun_dir.join("bun");
 
-    download_and_extract_bun(url, &paths.bin_dir).await?;
+    download_and_extract_bun(url, &paths.bun_dir).await?;
 
     // Make executable
     #[cfg(unix)]
@@ -249,21 +249,20 @@ fn signal_cli_download_url() -> String {
 
 /// Check if Java is available (bundled only - we don't use system Java)
 pub fn find_java() -> Option<PathBuf> {
-    if let Ok(paths) = config::paths() {
-        // Look for java binary in java_dir/bin/java (or java_dir/*/bin/java for extracted structure)
-        let direct = paths.java_dir.join("bin").join("java");
-        if direct.exists() {
-            return Some(direct);
-        }
+    let paths = config::paths().ok()?;
+    let entries = std::fs::read_dir(&paths.java_dir).ok()?;
 
-        // Check for extracted JRE directory structure (e.g., jdk-21.0.1+12-jre/bin/java)
-        if let Ok(entries) = std::fs::read_dir(&paths.java_dir) {
-            for entry in entries.flatten() {
-                let java_path = entry.path().join("bin").join("java");
-                if java_path.exists() {
-                    return Some(java_path);
-                }
-            }
+    for entry in entries.flatten() {
+        let base = entry.path();
+
+        #[cfg(target_os = "linux")]
+        let java_path = base.join("bin").join("java");
+
+        #[cfg(target_os = "macos")]
+        let java_path = base.join("Contents").join("Home").join("bin").join("java");
+
+        if java_path.exists() {
+            return Some(java_path);
         }
     }
 

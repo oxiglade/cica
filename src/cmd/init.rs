@@ -143,17 +143,11 @@ async fn setup_signal(existing_config: Option<Config>) -> Result<Config> {
     println!("You'll need to verify it with a code sent via text message.");
     println!();
 
-    // Download Java and signal-cli if needed
-    if setup::find_java().is_none() {
-        print!("Downloading Java runtime... ");
+    // Download dependencies if needed
+    if setup::find_java().is_none() || setup::find_signal_cli().is_none() {
+        print!("Setting up Signal runtime... ");
         std::io::Write::flush(&mut std::io::stdout())?;
         setup::ensure_java().await?;
-        println!("done");
-    }
-
-    if setup::find_signal_cli().is_none() {
-        print!("Downloading signal-cli... ");
-        std::io::Write::flush(&mut std::io::stdout())?;
         setup::ensure_signal_cli().await?;
         println!("done");
     }
