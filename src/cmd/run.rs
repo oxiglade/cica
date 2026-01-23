@@ -1,7 +1,8 @@
 use anyhow::Result;
+use tokio::signal;
 use tracing::{error, info};
 
-use crate::channels::{signal, telegram};
+use crate::channels::{signal as signal_channel, telegram};
 use crate::config::Config;
 
 /// Run the assistant (default command)
@@ -37,15 +38,22 @@ pub async fn run() -> Result<()> {
 
     if let Some(signal_config) = config.channels.signal {
         handles.push(tokio::spawn(async move {
-            if let Err(e) = signal::run(signal_config).await {
+            if let Err(e) = signal_channel::run(signal_config).await {
                 error!("Signal channel error: {}", e);
             }
         }));
     }
 
-    // Wait for all channels (they run forever unless they error)
-    for handle in handles {
-        let _ = handle.await;
+    // Wait for Ctrl+C
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down...");
+        }
+        _ = async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        } => {}
     }
 
     Ok(())

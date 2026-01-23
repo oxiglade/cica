@@ -219,7 +219,7 @@ fn validate_oauth_token(token: &str) -> Result<()> {
 // Java (for signal-cli)
 // ============================================================================
 
-const SIGNAL_CLI_VERSION: &str = "0.13.12";
+const SIGNAL_CLI_VERSION: &str = "0.13.22";
 
 fn java_download_url() -> Result<&'static str> {
     // Eclipse Temurin JRE 21 from Adoptium

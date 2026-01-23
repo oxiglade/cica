@@ -116,6 +116,8 @@ impl SignalDaemon {
         std::fs::create_dir_all(&paths.signal_data_dir)?;
 
         // Start signal-cli daemon
+        // Use --receive-mode manual so we can poll with the receive RPC method
+        let http_addr = format!("localhost:{}", DAEMON_PORT);
         let process = Command::new(&signal_cli)
             .args([
                 "-a",
@@ -124,8 +126,9 @@ impl SignalDaemon {
                 paths.signal_data_dir.to_str().unwrap(),
                 "daemon",
                 "--http",
-                "--http-port",
-                &DAEMON_PORT.to_string(),
+                &http_addr,
+                "--receive-mode",
+                "manual",
             ])
             .env("JAVA_HOME", java_home)
             .env(
@@ -226,6 +229,8 @@ struct Envelope {
     source: Option<String>,
     #[serde(rename = "sourceNumber")]
     source_number: Option<String>,
+    #[serde(rename = "sourceUuid")]
+    source_uuid: Option<String>,
     #[serde(rename = "sourceName")]
     source_name: Option<String>,
     #[serde(rename = "dataMessage")]
@@ -282,9 +287,10 @@ async fn run_message_loop(client: &HttpClient, phone_number: &str) -> Result<()>
 }
 
 /// Receive pending messages
-async fn receive_messages(client: &HttpClient, account: &str) -> Result<Vec<SignalMessage>> {
+async fn receive_messages(client: &HttpClient, _account: &str) -> Result<Vec<SignalMessage>> {
+    // In single-account daemon mode, we don't pass account parameter
     let mut params = ObjectParams::new();
-    params.insert("account", account)?;
+    params.insert("timeout", 1)?; // 1 second timeout
 
     let result: Value = client
         .request("receive", params)
@@ -300,13 +306,13 @@ async fn receive_messages(client: &HttpClient, account: &str) -> Result<Vec<Sign
 /// Send a message to a recipient
 async fn send_message(
     client: &HttpClient,
-    account: &str,
+    _account: &str,
     recipient: &str,
     message: &str,
 ) -> Result<()> {
+    // In single-account daemon mode, we don't pass account parameter
     let mut params = ObjectParams::new();
-    params.insert("account", account)?;
-    params.insert("recipients", vec![recipient])?;
+    params.insert("recipient", vec![recipient])?;
     params.insert("message", message)?;
 
     let _: Value = client
@@ -324,9 +330,10 @@ async fn handle_message(client: &HttpClient, account: &str, msg: SignalMessage) 
         None => return Ok(()),
     };
 
-    // Get sender info
+    // Get sender info - prefer phone number, fall back to UUID
     let sender = envelope
         .source_number
+        .or(envelope.source_uuid)
         .or(envelope.source)
         .unwrap_or_default();
 
@@ -421,8 +428,26 @@ async fn handle_onboarding(message: &str) -> Result<String> {
     Ok(response)
 }
 
+/// Result of registration attempt
+pub enum RegistrationResult {
+    /// Registration succeeded, SMS sent
+    Success,
+    /// CAPTCHA required - user needs to solve it
+    CaptchaRequired,
+    /// Already registered
+    AlreadyRegistered,
+    /// Authorization failed - number may be registered elsewhere
+    AuthorizationFailed,
+    /// Rate limited - too many attempts
+    RateLimited,
+}
+
 /// Register a new Signal account (called during setup)
-pub async fn register_account(phone_number: &str) -> Result<()> {
+pub async fn register_account(
+    phone_number: &str,
+    captcha: Option<&str>,
+    use_voice: bool,
+) -> Result<RegistrationResult> {
     let paths = config::paths()?;
     let java = setup::find_java().ok_or_else(|| anyhow!("Java not found"))?;
     let signal_cli = setup::find_signal_cli().ok_or_else(|| anyhow!("signal-cli not found"))?;
@@ -437,14 +462,33 @@ pub async fn register_account(phone_number: &str) -> Result<()> {
 
     info!("Registering Signal account for {}...", phone_number);
 
+    let mut args = vec![
+        "-a",
+        phone_number,
+        "--config",
+        paths.signal_data_dir.to_str().unwrap(),
+        "register",
+    ];
+
+    // Add voice flag if requested (voice call instead of SMS)
+    if use_voice {
+        args.push("-v");
+    }
+
+    // Add captcha if provided
+    let captcha_owned: String;
+    if let Some(c) = captcha {
+        captcha_owned = c.to_string();
+        args.push("--captcha");
+        args.push(&captcha_owned);
+        debug!(
+            "Using captcha token (first 50 chars): {}...",
+            &captcha_owned[..captcha_owned.len().min(50)]
+        );
+    }
+
     let output = Command::new(&signal_cli)
-        .args([
-            "-a",
-            phone_number,
-            "--config",
-            paths.signal_data_dir.to_str().unwrap(),
-            "register",
-        ])
+        .args(&args)
         .env("JAVA_HOME", java_home)
         .env(
             "PATH",
@@ -458,12 +502,50 @@ pub async fn register_account(phone_number: &str) -> Result<()> {
         .await
         .context("Failed to run signal-cli register")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Registration failed: {}", stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+    let combined_lower = combined.to_lowercase();
+
+    // Log for debugging
+    debug!("Registration stdout: {}", stdout);
+    debug!("Registration stderr: {}", stderr);
+    debug!("Registration exit status: {}", output.status);
+
+    if output.status.success() {
+        return Ok(RegistrationResult::Success);
     }
 
-    Ok(())
+    // Check for captcha requirement - but only if we didn't already provide one
+    // If we provided a captcha and still get this error, the captcha was invalid
+    if combined_lower.contains("captcha") {
+        if captcha.is_some() {
+            // We already provided a captcha but it failed - report specific error
+            bail!(
+                "CAPTCHA verification failed. The token may have expired or been invalid.\n\
+                 Please try again with a fresh CAPTCHA.\n\
+                 signal-cli output: {}",
+                combined.trim()
+            );
+        }
+        return Ok(RegistrationResult::CaptchaRequired);
+    }
+
+    if combined_lower.contains("already registered") {
+        return Ok(RegistrationResult::AlreadyRegistered);
+    }
+
+    // Authorization failed usually means the number is registered on another device
+    if combined_lower.contains("authorization failed") || combined_lower.contains("403") {
+        return Ok(RegistrationResult::AuthorizationFailed);
+    }
+
+    // Rate limited
+    if combined_lower.contains("rate limit") || combined_lower.contains("429") {
+        return Ok(RegistrationResult::RateLimited);
+    }
+
+    bail!("Registration failed: {}", combined.trim());
 }
 
 /// Verify a Signal account with SMS code (called during setup)
