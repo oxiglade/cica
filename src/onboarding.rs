@@ -19,6 +19,7 @@ use tracing::warn;
 
 use crate::config;
 use crate::memory::{MemoryIndex, memories_dir};
+use crate::skills;
 
 /// Onboarding phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,12 +298,48 @@ pub fn build_context_prompt_for_user(
 
     // Skills section
     lines.push("## Skills".to_string());
-    lines.push("Skills are a system for extending your capabilities. They live in your workspace's skills/ folder.".to_string());
+    lines.push(
+        "Skills extend your capabilities. They live in the skills/ folder of your workspace."
+            .to_string(),
+    );
     lines.push(String::new());
-    lines.push("IMPORTANT: When the user asks about something you can't do directly (like accessing email, calendar, APIs, etc.), always mention that we could create a skill for it together. For example: \"I don't have direct access to that, but we could create a skill for it together if you'd like!\"".to_string());
+
+    // Discover and list available skills
+    match skills::discover_skills() {
+        Ok(discovered) if !discovered.is_empty() => {
+            lines.push("### Available Skills".to_string());
+            lines.push("To use a skill, read its SKILL.md file at the location shown, then follow its instructions.".to_string());
+            lines.push(String::new());
+            lines.push(skills::format_skills_xml(&discovered));
+            lines.push(String::new());
+        }
+        Ok(_) => {
+            lines.push("No skills are currently installed.".to_string());
+            lines.push(String::new());
+        }
+        Err(e) => {
+            warn!("Failed to discover skills: {}", e);
+        }
+    }
+
+    lines.push("### Creating Skills".to_string());
+    lines.push("When the user asks about something you can't do directly (like accessing email, calendar, APIs, etc.), offer to create a skill for it.".to_string());
+    lines.push(String::new());
+    lines.push("Each skill is a folder in skills/ containing:".to_string());
+    lines.push("1. **SKILL.md** (required) - Instructions with YAML frontmatter:".to_string());
+    lines.push("   ```".to_string());
+    lines.push("   ---".to_string());
+    lines.push("   name: my-skill".to_string());
+    lines.push("   description: What this skill does".to_string());
+    lines.push("   ---".to_string());
+    lines.push("   # My Skill".to_string());
+    lines.push("   Instructions for using this skill...".to_string());
+    lines.push("   ```".to_string());
+    lines.push("2. **index.ts** - The implementation (TypeScript/Bun preferred)".to_string());
+    lines.push("3. **config.json** (optional) - Configuration/secrets".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "When building skills, prefer TypeScript/JavaScript and use the bundled Bun at: {}",
+        "Use the bundled Bun at: {}",
         paths.bun_dir.join("bun").display()
     ));
     lines.push(String::new());

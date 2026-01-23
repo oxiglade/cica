@@ -6,6 +6,7 @@ mod memory;
 mod onboarding;
 mod pairing;
 mod setup;
+mod skills;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
