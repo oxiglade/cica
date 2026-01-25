@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatAction};
@@ -6,7 +7,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use super::{
-    CommandResult, handle_onboarding, process_command, query_claude_with_session,
+    CommandResult, UserTaskManager, handle_onboarding, process_command, query_claude_with_session,
     reindex_user_memories,
 };
 use crate::config::TelegramConfig;
@@ -63,11 +64,17 @@ pub async fn run(config: TelegramConfig) -> Result<()> {
         warn!("Failed to set bot commands: {}", e);
     }
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| async move {
-        if let Err(e) = handle_message(&bot, &msg).await {
-            warn!("Error handling message: {}", e);
+    // Create shared task manager for per-user message handling
+    let task_manager = UserTaskManager::new();
+
+    teloxide::repl(bot, move |bot: Bot, msg: Message| {
+        let task_manager = Arc::clone(&task_manager);
+        async move {
+            if let Err(e) = handle_message(&bot, &msg, task_manager).await {
+                warn!("Error handling message: {}", e);
+            }
+            Ok(())
         }
-        Ok(())
     })
     .await;
 
@@ -75,7 +82,11 @@ pub async fn run(config: TelegramConfig) -> Result<()> {
 }
 
 /// Handle an incoming message
-async fn handle_message(bot: &Bot, msg: &Message) -> Result<()> {
+async fn handle_message(
+    bot: &Bot,
+    msg: &Message,
+    task_manager: Arc<UserTaskManager>,
+) -> Result<()> {
     let user = msg.from.as_ref();
     let user_id = user.map(|u| u.id.0.to_string()).unwrap_or_default();
     let username = user.and_then(|u| u.username.clone());
@@ -138,27 +149,82 @@ async fn handle_message(bot: &Bot, msg: &Message) -> Result<()> {
         return Ok(());
     }
 
-    // Start periodic typing indicator (will run until we drop the cancel handle)
-    let typing_cancel = start_typing_indicator(bot.clone(), msg.chat.id);
+    // Queue the message for processing with debounce and interruption support
+    let user_key = format!("telegram:{}", user_id);
+    let bot_clone = bot.clone();
+    let chat_id = msg.chat.id;
+    let user_id_clone = user_id.clone();
+    let text_owned = text.to_string();
 
-    // Query Claude with context (and resume if we have a session)
-    let context_prompt = onboarding::build_context_prompt_for_user(
-        Some("Telegram"),
-        Some("telegram"),
-        Some(&user_id),
-        Some(text),
-    )?;
+    task_manager
+        .process_message(user_key, text_owned, move |messages| async move {
+            // Combine multiple messages if batched
+            let combined_text = messages.join("\n\n");
 
-    let (response, _session_id) =
-        query_claude_with_session(&mut store, "telegram", &user_id, text, context_prompt).await?;
+            // Start periodic typing indicator
+            let typing_cancel = start_typing_indicator(bot_clone.clone(), chat_id);
 
-    // Stop typing indicator before sending response
-    drop(typing_cancel);
+            // Query Claude with context
+            let context_prompt = match onboarding::build_context_prompt_for_user(
+                Some("Telegram"),
+                Some("telegram"),
+                Some(&user_id_clone),
+                Some(&combined_text),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to build context prompt: {}", e);
+                    drop(typing_cancel);
+                    let _ = bot_clone
+                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
+                        .await;
+                    return;
+                }
+            };
 
-    bot.send_message(msg.chat.id, response).await?;
+            let mut store = match PairingStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to load pairing store: {}", e);
+                    drop(typing_cancel);
+                    let _ = bot_clone
+                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
+                        .await;
+                    return;
+                }
+            };
 
-    // Re-index memories in case Claude saved new ones
-    reindex_user_memories("telegram", &user_id);
+            let (response, _session_id) = match query_claude_with_session(
+                &mut store,
+                "telegram",
+                &user_id_clone,
+                &combined_text,
+                context_prompt,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Claude query failed: {}", e);
+                    drop(typing_cancel);
+                    let _ = bot_clone
+                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
+                        .await;
+                    return;
+                }
+            };
+
+            // Stop typing indicator before sending response
+            drop(typing_cancel);
+
+            if let Err(e) = bot_clone.send_message(chat_id, response).await {
+                warn!("Failed to send message: {}", e);
+            }
+
+            // Re-index memories in case Claude saved new ones
+            reindex_user_memories("telegram", &user_id_clone);
+        })
+        .await;
 
     Ok(())
 }
