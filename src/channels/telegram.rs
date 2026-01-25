@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::ChatAction;
+use teloxide::types::{BotCommand, ChatAction};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -52,6 +52,15 @@ pub async fn run(config: TelegramConfig) -> Result<()> {
     let bot = Bot::new(&config.bot_token);
 
     info!("Starting Telegram bot...");
+
+    // Register bot commands for the UI menu
+    let commands = vec![
+        BotCommand::new("new", "Start a new conversation"),
+        BotCommand::new("commands", "Show available commands"),
+    ];
+    if let Err(e) = bot.set_my_commands(commands).await {
+        warn!("Failed to set bot commands: {}", e);
+    }
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| async move {
         if let Err(e) = handle_message(&bot, &msg).await {
