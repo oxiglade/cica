@@ -2,13 +2,104 @@ pub mod signal;
 pub mod telegram;
 
 use anyhow::Result;
-use tracing::warn;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
 
 use crate::claude;
 use crate::memory::MemoryIndex;
 use crate::onboarding;
 use crate::pairing::PairingStore;
 use crate::skills;
+
+/// Debounce duration for batching rapid messages
+const DEBOUNCE_MS: u64 = 200;
+
+/// Active task for a user
+struct ActiveTask {
+    handle: JoinHandle<()>,
+}
+
+/// Manages per-user message processing with debouncing and interruption
+pub struct UserTaskManager {
+    tasks: Mutex<HashMap<String, ActiveTask>>,
+    pending: Mutex<HashMap<String, Vec<String>>>,
+}
+
+impl UserTaskManager {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tasks: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Process a message for a user.
+    /// If there's already a task running for this user, it will be aborted.
+    /// Messages are debounced - if more arrive within DEBOUNCE_MS, they're batched.
+    pub async fn process_message<F, Fut>(
+        self: &Arc<Self>,
+        user_key: String,
+        message: String,
+        handler: F,
+    ) where
+        F: FnOnce(Vec<String>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        // Add message to pending queue
+        {
+            let mut pending = self.pending.lock().await;
+            pending
+                .entry(user_key.clone())
+                .or_insert_with(Vec::new)
+                .push(message);
+        }
+
+        let mut tasks = self.tasks.lock().await;
+
+        // If there's an existing task, abort it - we'll start fresh with all pending messages
+        if let Some(existing) = tasks.remove(&user_key) {
+            debug!("Aborting existing task for {}", user_key);
+            existing.handle.abort();
+        }
+
+        // Spawn new task with debounce
+        let manager = Arc::clone(self);
+        let user_key_clone = user_key.clone();
+
+        let handle = tokio::spawn(async move {
+            // Debounce: wait a bit for more messages
+            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+
+            // Collect all pending messages for this user
+            let messages = {
+                let mut pending = manager.pending.lock().await;
+                pending.remove(&user_key_clone).unwrap_or_default()
+            };
+
+            if messages.is_empty() {
+                return;
+            }
+
+            debug!(
+                "Processing {} message(s) for {}",
+                messages.len(),
+                user_key_clone
+            );
+
+            // Run the handler
+            handler(messages).await;
+
+            // Clean up task entry
+            manager.tasks.lock().await.remove(&user_key_clone);
+        });
+
+        tasks.insert(user_key, ActiveTask { handle });
+    }
+}
 
 /// Result of processing a command
 pub enum CommandResult {

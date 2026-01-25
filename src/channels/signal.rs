@@ -16,7 +16,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    CommandResult, handle_onboarding, process_command, query_claude_with_session,
+    CommandResult, UserTaskManager, handle_onboarding, process_command, query_claude_with_session,
     reindex_user_memories,
 };
 use crate::config::{self, SignalConfig};
@@ -282,8 +282,11 @@ pub async fn run(config: SignalConfig) -> Result<()> {
 
     info!("Signal bot running. Listening for messages...");
 
+    // Create shared task manager for per-user message handling
+    let task_manager = UserTaskManager::new();
+
     // Set up graceful shutdown
-    let result = run_message_loop(client, &config.phone_number).await;
+    let result = run_message_loop(client, &config.phone_number, task_manager).await;
 
     // Shutdown daemon gracefully
     daemon.shutdown().await;
@@ -292,12 +295,19 @@ pub async fn run(config: SignalConfig) -> Result<()> {
 }
 
 /// Main message polling loop
-async fn run_message_loop(client: Arc<HttpClient>, phone_number: &str) -> Result<()> {
+async fn run_message_loop(
+    client: Arc<HttpClient>,
+    phone_number: &str,
+    task_manager: Arc<UserTaskManager>,
+) -> Result<()> {
     loop {
         match receive_messages(&client, phone_number).await {
             Ok(messages) => {
                 for msg in messages {
-                    if let Err(e) = handle_message(client.clone(), phone_number, msg).await {
+                    if let Err(e) =
+                        handle_message(client.clone(), phone_number, msg, Arc::clone(&task_manager))
+                            .await
+                    {
                         error!("Error handling message: {}", e);
                     }
                 }
@@ -389,7 +399,12 @@ fn start_typing_indicator(client: Arc<HttpClient>, recipient: String) -> oneshot
 }
 
 /// Handle an incoming message
-async fn handle_message(client: Arc<HttpClient>, account: &str, msg: SignalMessage) -> Result<()> {
+async fn handle_message(
+    client: Arc<HttpClient>,
+    account: &str,
+    msg: SignalMessage,
+    task_manager: Arc<UserTaskManager>,
+) -> Result<()> {
     let envelope = match msg.envelope {
         Some(e) => e,
         None => return Ok(()),
@@ -452,27 +467,96 @@ async fn handle_message(client: Arc<HttpClient>, account: &str, msg: SignalMessa
         return Ok(());
     }
 
-    // Start periodic typing indicator
-    let typing_cancel = start_typing_indicator(client.clone(), sender.clone());
+    // Queue the message for processing with debounce and interruption support
+    let user_key = format!("signal:{}", sender);
+    let client_clone = client.clone();
+    let account_owned = account.to_string();
+    let sender_clone = sender.clone();
+    let text_owned = text.clone();
 
-    // Query Claude with context (and resume if we have a session)
-    let context_prompt = onboarding::build_context_prompt_for_user(
-        Some("Signal"),
-        Some("signal"),
-        Some(&sender),
-        Some(&text),
-    )?;
+    task_manager
+        .process_message(user_key, text_owned, move |messages| async move {
+            // Combine multiple messages if batched
+            let combined_text = messages.join("\n\n");
 
-    let (response, _session_id) =
-        query_claude_with_session(&mut store, "signal", &sender, &text, context_prompt).await?;
+            // Start periodic typing indicator
+            let typing_cancel = start_typing_indicator(client_clone.clone(), sender_clone.clone());
 
-    // Stop typing indicator before sending response
-    drop(typing_cancel);
+            // Query Claude with context
+            let context_prompt = match onboarding::build_context_prompt_for_user(
+                Some("Signal"),
+                Some("signal"),
+                Some(&sender_clone),
+                Some(&combined_text),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to build context prompt: {}", e);
+                    drop(typing_cancel);
+                    let _ = send_message(
+                        &client_clone,
+                        &account_owned,
+                        &sender_clone,
+                        &format!("Sorry, I encountered an error: {}", e),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
-    send_message(&client, account, &sender, &response).await?;
+            let mut store = match PairingStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to load pairing store: {}", e);
+                    drop(typing_cancel);
+                    let _ = send_message(
+                        &client_clone,
+                        &account_owned,
+                        &sender_clone,
+                        &format!("Sorry, I encountered an error: {}", e),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
-    // Re-index memories in case Claude saved new ones
-    reindex_user_memories("signal", &sender);
+            let (response, _session_id) = match query_claude_with_session(
+                &mut store,
+                "signal",
+                &sender_clone,
+                &combined_text,
+                context_prompt,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Claude query failed: {}", e);
+                    drop(typing_cancel);
+                    let _ = send_message(
+                        &client_clone,
+                        &account_owned,
+                        &sender_clone,
+                        &format!("Sorry, I encountered an error: {}", e),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            // Stop typing indicator before sending response
+            drop(typing_cancel);
+
+            if let Err(e) =
+                send_message(&client_clone, &account_owned, &sender_clone, &response).await
+            {
+                warn!("Failed to send message: {}", e);
+            }
+
+            // Re-index memories in case Claude saved new ones
+            reindex_user_memories("signal", &sender_clone);
+        })
+        .await;
 
     Ok(())
 }
