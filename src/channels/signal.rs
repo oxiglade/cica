@@ -112,10 +112,9 @@ impl SignalDaemon {
         info!("Starting signal-cli daemon on port {}...", DAEMON_PORT);
 
         // Build JAVA_HOME from java binary path
-        // On macOS, java is at .../Contents/Home/bin/java, so we need to go up 2 levels to get Contents/Home
         let java_home = java
             .parent() // bin
-            .and_then(|p| p.parent()) // Home (on macOS) or jdk root (on Linux)
+            .and_then(|p| p.parent())
             .ok_or_else(|| anyhow!("Could not determine JAVA_HOME"))?;
 
         // Ensure data directory exists
