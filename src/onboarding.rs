@@ -339,12 +339,34 @@ pub fn build_context_prompt_for_user(
     lines.push("   Instructions for using this skill...".to_string());
     lines.push("   ```".to_string());
     lines.push("2. **index.ts** - The implementation (TypeScript/Bun preferred)".to_string());
-    lines.push("3. **config.json** (optional) - Configuration/secrets".to_string());
     lines.push(String::new());
     lines.push(format!(
         "Use the bundled Bun at: {}",
         paths.bun_dir.join("bun").display()
     ));
+    lines.push(String::new());
+
+    // Skill configuration
+    lines.push("### Skill Configuration".to_string());
+    lines.push("Skills that need configuration (API keys, credentials, preferences) should support two config locations:".to_string());
+    lines.push(String::new());
+    lines.push(
+        "1. **Global config**: `skills/{skill-name}/config.json` - shared by all users".to_string(),
+    );
+    lines.push("2. **Per-user config**: `users/{channel}_{user_id}/skill-configs/{skill-name}.json` - specific to one user".to_string());
+    lines.push(String::new());
+    lines.push("**When creating a skill that needs config:**".to_string());
+    lines.push(
+        "- Ask the user: \"Should this config be shared globally, or specific to just you?\""
+            .to_string(),
+    );
+    lines.push("- Global: useful for shared API keys or server-wide settings".to_string());
+    lines
+        .push("- Per-user: useful for personal credentials, user-specific preferences".to_string());
+    lines.push(String::new());
+    lines.push("**When running a skill:**".to_string());
+    lines.push("- Check for per-user config first (using current channel and user_id)".to_string());
+    lines.push("- Fall back to global config if no per-user config exists".to_string());
     lines.push(String::new());
 
     // Workspace

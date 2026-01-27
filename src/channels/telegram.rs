@@ -81,7 +81,7 @@ impl Channel for TelegramChannel {
 /// Get the directory where Telegram attachments are stored
 fn get_telegram_attachments_dir() -> Result<PathBuf> {
     let paths = config::paths()?;
-    let dir = paths.base.join("telegram_attachments");
+    let dir = paths.internal_dir.join("telegram_attachments");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
