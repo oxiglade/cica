@@ -1,10 +1,14 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, ChatAction};
+use teloxide::types::{BotCommand, ChatAction, PhotoSize};
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::config;
 
 use super::{
     CommandResult, UserTaskManager, handle_onboarding, process_command, query_claude_with_session,
@@ -38,6 +42,45 @@ fn start_typing_indicator(bot: Bot, chat_id: ChatId) -> oneshot::Sender<()> {
     });
 
     cancel_tx
+}
+
+/// Get the directory where Telegram attachments are stored
+fn get_telegram_attachments_dir() -> Result<PathBuf> {
+    let paths = config::paths()?;
+    let dir = paths.base.join("telegram_attachments");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Download a photo from Telegram and save it locally
+/// Returns the local file path on success
+async fn download_photo(bot: &Bot, photo: &PhotoSize) -> Result<PathBuf> {
+    let file = bot.get_file(&photo.file.id).await?;
+    let file_path = file.path;
+
+    // Determine extension from the file path
+    let extension = file_path.rsplit('.').next().unwrap_or("jpg");
+
+    let attachments_dir = get_telegram_attachments_dir()?;
+    let local_path = attachments_dir.join(format!("{}.{}", photo.file.unique_id, extension));
+
+    // Skip download if file already exists
+    if local_path.exists() {
+        debug!("Photo already downloaded: {:?}", local_path);
+        return Ok(local_path);
+    }
+
+    // Download the file
+    let mut dst = tokio::fs::File::create(&local_path).await?;
+    bot.download_file(&file_path, &mut dst).await?;
+
+    info!("Downloaded photo to {:?}", local_path);
+    Ok(local_path)
+}
+
+/// Get the largest photo from a list of photo sizes
+fn get_largest_photo(photos: &[PhotoSize]) -> Option<&PhotoSize> {
+    photos.iter().max_by_key(|p| p.width * p.height)
 }
 
 /// Validate a Telegram bot token by calling getMe
@@ -116,11 +159,33 @@ async fn handle_message(
     }
 
     // User is approved - process the message
-    let Some(text) = msg.text() else {
+    // Get text (either from text message or photo caption)
+    let text = msg.text().or(msg.caption()).unwrap_or_default();
+
+    // Download any photos in the message
+    let mut image_paths: Vec<PathBuf> = Vec::new();
+    if let Some(photos) = msg.photo() {
+        if let Some(largest) = get_largest_photo(photos) {
+            match download_photo(bot, largest).await {
+                Ok(path) => image_paths.push(path),
+                Err(e) => warn!("Failed to download photo: {}", e),
+            }
+        }
+    }
+
+    // Skip if no text and no images
+    if text.is_empty() && image_paths.is_empty() {
         return Ok(());
-    };
+    }
 
     info!("Message from {}: {}", user_id, text);
+    if !image_paths.is_empty() {
+        info!(
+            "Message includes {} image(s): {:?}",
+            image_paths.len(),
+            image_paths
+        );
+    }
 
     // Check if onboarding is complete for this user
     let onboarding_complete = onboarding::is_complete_for_user("telegram", &user_id)?;
@@ -154,10 +219,24 @@ async fn handle_message(
     let bot_clone = bot.clone();
     let chat_id = msg.chat.id;
     let user_id_clone = user_id.clone();
-    let text_owned = text.to_string();
+
+    // Build the message text with image references
+    // Images are referenced using @path syntax which Claude Code understands
+    let mut text_with_images = text.to_string();
+    for (i, path) in image_paths.iter().enumerate() {
+        if let Some(path_str) = path.to_str() {
+            if text_with_images.is_empty() {
+                text_with_images = format!("@{}", path_str);
+            } else if i == 0 {
+                text_with_images = format!("{}\n\n@{}", text_with_images, path_str);
+            } else {
+                text_with_images = format!("{} @{}", text_with_images, path_str);
+            }
+        }
+    }
 
     task_manager
-        .process_message(user_key, text_owned, move |messages| async move {
+        .process_message(user_key, text_with_images, move |messages| async move {
             // Combine multiple messages if batched
             let combined_text = messages.join("\n\n");
 

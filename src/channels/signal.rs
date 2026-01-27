@@ -264,6 +264,17 @@ struct Envelope {
 #[derive(Debug, Deserialize)]
 struct DataMessage {
     message: Option<String>,
+    attachments: Option<Vec<Attachment>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Attachment {
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+    id: Option<String>,
+    #[serde(rename = "filename")]
+    filename: Option<String>,
+    size: Option<u64>,
 }
 
 /// Run the Signal bot
@@ -398,6 +409,28 @@ fn start_typing_indicator(client: Arc<HttpClient>, recipient: String) -> oneshot
     cancel_tx
 }
 
+/// Get the path where signal-cli stores attachments
+fn get_attachment_path(attachment_id: &str) -> Option<PathBuf> {
+    let paths = config::paths().ok()?;
+    let attachment_path = paths
+        .signal_data_dir
+        .join("attachments")
+        .join(attachment_id);
+    if attachment_path.exists() {
+        Some(attachment_path)
+    } else {
+        None
+    }
+}
+
+/// Check if a content type is an image type that Claude can process
+fn is_image_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    )
+}
+
 /// Handle an incoming message
 async fn handle_message(
     client: Arc<HttpClient>,
@@ -421,11 +454,31 @@ async fn handle_message(
         return Ok(());
     }
 
-    // Get message text
-    let text = match envelope.data_message.and_then(|d| d.message) {
-        Some(t) if !t.is_empty() => t,
-        _ => return Ok(()), // No text message
+    // Extract message content and attachments
+    let data_message = match envelope.data_message {
+        Some(dm) => dm,
+        None => return Ok(()),
     };
+
+    let text = data_message.message.clone().unwrap_or_default();
+    let attachments = data_message.attachments.unwrap_or_default();
+
+    // Collect image attachment paths
+    let image_paths: Vec<PathBuf> = attachments
+        .iter()
+        .filter(|a| {
+            a.content_type
+                .as_ref()
+                .map(|ct| is_image_content_type(ct))
+                .unwrap_or(false)
+        })
+        .filter_map(|a| a.id.as_ref().and_then(|id| get_attachment_path(id)))
+        .collect();
+
+    // Skip if no text and no images
+    if text.is_empty() && image_paths.is_empty() {
+        return Ok(());
+    }
 
     let display_name = envelope.source_name;
 
@@ -472,10 +525,33 @@ async fn handle_message(
     let client_clone = client.clone();
     let account_owned = account.to_string();
     let sender_clone = sender.clone();
-    let text_owned = text.clone();
+
+    // Build the message text with image references
+    // Images are referenced using @path syntax which Claude Code understands
+    let mut text_with_images = text.clone();
+    for (i, path) in image_paths.iter().enumerate() {
+        if let Some(path_str) = path.to_str() {
+            if text_with_images.is_empty() {
+                text_with_images = format!("@{}", path_str);
+            } else if i == 0 {
+                text_with_images = format!("{}\n\n@{}", text_with_images, path_str);
+            } else {
+                text_with_images = format!("{} @{}", text_with_images, path_str);
+            }
+        }
+    }
+
+    // Log that we're processing images
+    if !image_paths.is_empty() {
+        info!(
+            "Message includes {} image(s): {:?}",
+            image_paths.len(),
+            image_paths
+        );
+    }
 
     task_manager
-        .process_message(user_key, text_owned, move |messages| async move {
+        .process_message(user_key, text_with_images, move |messages| async move {
             // Combine multiple messages if batched
             let combined_text = messages.join("\n\n");
 

@@ -49,6 +49,8 @@ impl UserTaskManager {
         F: FnOnce(Vec<String>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        debug!("Queueing message for {}: {}", user_key, message);
+
         // Add message to pending queue
         {
             let mut pending = self.pending.lock().await;
