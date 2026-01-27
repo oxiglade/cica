@@ -55,3 +55,8 @@ sqlite-vec = "0.1.7-alpha.2"
 
 # For zero-copy vector conversion
 zerocopy = { version = "0.8", features = ["derive"] }
+
+# Cron job scheduling
+croner = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }

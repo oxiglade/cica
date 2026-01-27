@@ -10,6 +10,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::claude;
+use crate::cron::{
+    self, CronSchedule, CronStore, format_timestamp, parse_add_command, truncate_for_name,
+};
 use crate::memory::MemoryIndex;
 use crate::onboarding;
 use crate::pairing::PairingStore;
@@ -109,6 +112,8 @@ pub enum CommandResult {
     NotACommand,
     /// Command was handled, return this response to the user
     Response(String),
+    /// Trigger async cron job execution (job_id)
+    CronRun(String),
 }
 
 /// Available commands
@@ -116,6 +121,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/commands", "Show available commands"),
     ("/new", "Start a new conversation"),
     ("/skills", "List available skills"),
+    ("/cron", "Manage scheduled jobs"),
 ];
 
 /// Process a command if the message is one.
@@ -162,7 +168,271 @@ pub fn process_command(
         return Ok(CommandResult::Response(response));
     }
 
+    // Handle /cron commands
+    if text.starts_with("/cron") {
+        let args = text.strip_prefix("/cron").unwrap_or("").trim();
+        return process_cron_command(channel, user_id, args);
+    }
+
     Ok(CommandResult::NotACommand)
+}
+
+/// Process /cron subcommands
+fn process_cron_command(channel: &str, user_id: &str, args: &str) -> Result<CommandResult> {
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    let subcommand = parts.first().copied().unwrap_or("help");
+    let rest = parts.get(1).copied().unwrap_or("");
+
+    match subcommand {
+        "list" | "ls" => {
+            let store = CronStore::load()?;
+            let jobs = store.list_for_user(channel, user_id);
+
+            if jobs.is_empty() {
+                return Ok(CommandResult::Response(
+                    "No scheduled jobs.\n\nUse /cron add to create one. Try /cron help for usage."
+                        .to_string(),
+                ));
+            }
+
+            let mut response = String::from("Your scheduled jobs:\n");
+            for job in jobs {
+                let status = job.state.last_status.as_str();
+                let next = job
+                    .state
+                    .next_run_at
+                    .map(format_timestamp)
+                    .unwrap_or_else(|| "—".to_string());
+                let enabled = if job.enabled { "" } else { " (paused)" };
+
+                response.push_str(&format!(
+                    "\n[{}] {}{}\n  Schedule: {}\n  Status: {} | Next: {}\n",
+                    job.short_id(),
+                    job.name,
+                    enabled,
+                    job.schedule.description(),
+                    status,
+                    next
+                ));
+            }
+            Ok(CommandResult::Response(response))
+        }
+
+        "add" => {
+            if rest.is_empty() {
+                return Ok(CommandResult::Response(
+                    "Usage: /cron add <schedule> <prompt>\n\n\
+                     Examples:\n\
+                     /cron add every 1h Check my emails\n\
+                     /cron add every 10s Say hello\n\
+                     /cron add 0 9 * * * Good morning!"
+                        .to_string(),
+                ));
+            }
+
+            let (schedule, prompt) = match parse_add_command(rest) {
+                Ok(result) => result,
+                Err(e) => return Ok(CommandResult::Response(format!("Error: {}", e))),
+            };
+
+            let name = truncate_for_name(&prompt, 30);
+            let mut store = CronStore::load()?;
+            let job = cron::CronJob::new(
+                name.clone(),
+                prompt,
+                schedule.clone(),
+                channel.to_string(),
+                user_id.to_string(),
+            );
+            let id = store.add(job)?;
+
+            let next = match &schedule {
+                CronSchedule::At(ts) => format_timestamp(*ts),
+                CronSchedule::Every(_) | CronSchedule::Cron(_) => {
+                    let store = CronStore::load()?;
+                    store
+                        .jobs
+                        .get(&id)
+                        .and_then(|j| j.state.next_run_at)
+                        .map(format_timestamp)
+                        .unwrap_or_else(|| "soon".to_string())
+                }
+            };
+
+            Ok(CommandResult::Response(format!(
+                "Created job [{}] \"{}\"\nSchedule: {}\nNext run: {}\n\nUse /cron run {} to test it now!",
+                &id[..8],
+                name,
+                schedule.description(),
+                next,
+                &id[..8]
+            )))
+        }
+
+        "remove" | "rm" | "delete" => {
+            let id = rest.trim();
+            if id.is_empty() {
+                return Ok(CommandResult::Response(
+                    "Usage: /cron remove <job-id>".to_string(),
+                ));
+            }
+
+            let mut store = CronStore::load()?;
+
+            // Find job by full ID or prefix
+            let job_id = find_job_id(&store, channel, user_id, id)?;
+
+            match store.remove(&job_id, channel, user_id)? {
+                Some(job) => Ok(CommandResult::Response(format!(
+                    "Removed job [{}] \"{}\"",
+                    job.short_id(),
+                    job.name
+                ))),
+                None => Ok(CommandResult::Response(format!("Job not found: {}", id))),
+            }
+        }
+
+        "run" => {
+            let id = rest.trim();
+            if id.is_empty() {
+                return Ok(CommandResult::Response(
+                    "Usage: /cron run <job-id>".to_string(),
+                ));
+            }
+
+            let store = CronStore::load()?;
+            let job_id = find_job_id(&store, channel, user_id, id)?;
+
+            // Return special variant for async execution by the channel handler
+            Ok(CommandResult::CronRun(job_id))
+        }
+
+        "pause" | "disable" => {
+            let id = rest.trim();
+            if id.is_empty() {
+                return Ok(CommandResult::Response(
+                    "Usage: /cron pause <job-id>".to_string(),
+                ));
+            }
+
+            let mut store = CronStore::load()?;
+            let job_id = find_job_id(&store, channel, user_id, id)?;
+
+            let result = if let Some(job) = store.get_mut(&job_id) {
+                if job.channel != channel || job.user_id != user_id {
+                    return Ok(CommandResult::Response("Job not found".to_string()));
+                }
+                job.enabled = false;
+                job.state.next_run_at = None;
+                Some((job.short_id().to_string(), job.name.clone()))
+            } else {
+                None
+            };
+
+            if let Some((short_id, name)) = result {
+                store.save()?;
+                Ok(CommandResult::Response(format!(
+                    "Paused job [{}] \"{}\"",
+                    short_id, name
+                )))
+            } else {
+                Ok(CommandResult::Response(format!("Job not found: {}", id)))
+            }
+        }
+
+        "resume" | "enable" => {
+            let id = rest.trim();
+            if id.is_empty() {
+                return Ok(CommandResult::Response(
+                    "Usage: /cron resume <job-id>".to_string(),
+                ));
+            }
+
+            let mut store = CronStore::load()?;
+            let job_id = find_job_id(&store, channel, user_id, id)?;
+
+            let result = if let Some(job) = store.get_mut(&job_id) {
+                if job.channel != channel || job.user_id != user_id {
+                    return Ok(CommandResult::Response("Job not found".to_string()));
+                }
+                job.enabled = true;
+                job.update_next_run(cron::store::now_millis());
+                let next = job
+                    .state
+                    .next_run_at
+                    .map(format_timestamp)
+                    .unwrap_or_else(|| "soon".to_string());
+                Some((job.short_id().to_string(), job.name.clone(), next))
+            } else {
+                None
+            };
+
+            if let Some((short_id, name, next)) = result {
+                store.save()?;
+                Ok(CommandResult::Response(format!(
+                    "Resumed job [{}] \"{}\"\nNext run: {}",
+                    short_id, name, next
+                )))
+            } else {
+                Ok(CommandResult::Response(format!("Job not found: {}", id)))
+            }
+        }
+
+        _ => Ok(CommandResult::Response(
+            "Cron job commands:\n\n\
+             /cron list - List your scheduled jobs\n\
+             /cron add <schedule> <prompt> - Create a new job\n\
+             /cron remove <job-id> - Delete a job\n\
+             /cron run <job-id> - Run immediately (for testing)\n\
+             /cron pause <job-id> - Pause a job\n\
+             /cron resume <job-id> - Resume a paused job\n\n\
+             Schedule formats:\n\
+             • every 10s / every 5m / every 1h - Recurring interval\n\
+             • at 2024-01-28 14:00 - One-time execution\n\
+             • 0 9 * * * - Cron expression (9 AM daily)\n\n\
+             Examples:\n\
+             /cron add every 1h Check my inbox\n\
+             /cron add every 10s Say hello\n\
+             /cron add 0 9 * * * Good morning!"
+                .to_string(),
+        )),
+    }
+}
+
+/// Find a job ID by full ID or prefix match
+fn find_job_id(
+    store: &CronStore,
+    channel: &str,
+    user_id: &str,
+    id_or_prefix: &str,
+) -> Result<String> {
+    let id = id_or_prefix.trim();
+
+    // First try exact match
+    if store.get(id, channel, user_id).is_some() {
+        return Ok(id.to_string());
+    }
+
+    // Try prefix match
+    let matches: Vec<_> = store
+        .list_for_user(channel, user_id)
+        .into_iter()
+        .filter(|j| j.id.starts_with(id))
+        .collect();
+
+    match matches.len() {
+        0 => anyhow::bail!("Job not found: {}", id),
+        1 => Ok(matches[0].id.clone()),
+        _ => anyhow::bail!(
+            "Ambiguous job ID '{}'. Matches: {}",
+            id,
+            matches
+                .iter()
+                .map(|j| j.short_id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Query Claude with automatic session recovery.

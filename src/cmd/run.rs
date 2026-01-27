@@ -1,9 +1,15 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::signal;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::channels::{signal as signal_channel, telegram};
 use crate::config::Config;
+use crate::cron::{CronConfig, CronService, SystemClock};
 use crate::memory::MemoryIndex;
 use crate::pairing::PairingStore;
 use crate::setup;
@@ -37,6 +43,9 @@ pub async fn run() -> Result<()> {
     // Index memories for all approved users at startup
     index_all_user_memories();
 
+    // Start cron scheduler service
+    let cron_service = start_cron_service(&config)?;
+
     // Spawn tasks for each configured channel
     let mut handles = Vec::new();
 
@@ -68,6 +77,97 @@ pub async fn run() -> Result<()> {
         } => {}
     }
 
+    // Stop cron service
+    if let Some(service) = cron_service {
+        let mut service = service.lock().await;
+        service.stop().await;
+    }
+
+    Ok(())
+}
+
+/// Start the cron scheduler service
+fn start_cron_service(config: &Config) -> Result<Option<Arc<Mutex<CronService<SystemClock>>>>> {
+    let clock = SystemClock;
+    let cron_config = CronConfig::default();
+
+    let mut service = match CronService::new(clock, cron_config) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to initialize cron service: {}", e);
+            return Ok(None);
+        }
+    };
+
+    // Create result sender that routes messages to the appropriate channel
+    let telegram_token = config
+        .channels
+        .telegram
+        .as_ref()
+        .map(|c| c.bot_token.clone());
+    let signal_phone = config
+        .channels
+        .signal
+        .as_ref()
+        .map(|c| c.phone_number.clone());
+
+    let result_sender: crate::cron::ResultSender = Arc::new(move |channel, user_id, message| {
+        let telegram_token = telegram_token.clone();
+        let signal_phone = signal_phone.clone();
+
+        Box::pin(async move {
+            match channel.as_str() {
+                "telegram" => {
+                    if let Some(token) = telegram_token {
+                        send_telegram_message(&token, &user_id, &message).await
+                    } else {
+                        Err(anyhow::anyhow!("Telegram not configured"))
+                    }
+                }
+                "signal" => {
+                    if let Some(_phone) = signal_phone {
+                        send_signal_message(&user_id, &message).await
+                    } else {
+                        Err(anyhow::anyhow!("Signal not configured"))
+                    }
+                }
+                _ => Err(anyhow::anyhow!("Unknown channel: {}", channel)),
+            }
+        }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>
+    });
+
+    service.start(result_sender);
+    info!("Cron scheduler started");
+
+    Ok(Some(Arc::new(Mutex::new(service))))
+}
+
+/// Send a message via Telegram
+async fn send_telegram_message(token: &str, user_id: &str, message: &str) -> Result<()> {
+    use teloxide::prelude::*;
+
+    let bot = Bot::new(token);
+    let chat_id: i64 = user_id.parse()?;
+    bot.send_message(ChatId(chat_id), message).await?;
+    Ok(())
+}
+
+/// Send a message via Signal
+async fn send_signal_message(recipient: &str, message: &str) -> Result<()> {
+    use jsonrpsee::core::client::ClientT;
+    use jsonrpsee::core::params::ObjectParams;
+    use jsonrpsee::http_client::HttpClientBuilder;
+    use serde_json::Value;
+
+    // Connect to the signal-cli daemon
+    let url = "http://127.0.0.1:18080/api/v1/rpc";
+    let client = HttpClientBuilder::default().build(url)?;
+
+    let mut params = ObjectParams::new();
+    params.insert("recipient", vec![recipient])?;
+    params.insert("message", message)?;
+
+    let _: Value = client.request("send", params).await?;
     Ok(())
 }
 

@@ -2,6 +2,7 @@ mod channels;
 mod claude;
 mod cmd;
 mod config;
+mod cron;
 mod memory;
 mod onboarding;
 mod pairing;

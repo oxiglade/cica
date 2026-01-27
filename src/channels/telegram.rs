@@ -8,7 +8,9 @@ use teloxide::types::{BotCommand, ChatAction, PhotoSize};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use crate::claude::{self, QueryOptions};
 use crate::config;
+use crate::cron::CronStore;
 
 use super::{
     CommandResult, UserTaskManager, handle_onboarding, process_command, query_claude_with_session,
@@ -17,6 +19,25 @@ use super::{
 use crate::config::TelegramConfig;
 use crate::onboarding;
 use crate::pairing::PairingStore;
+
+/// Execute a cron job manually and return the output
+async fn execute_cron_job(job_id: &str, channel: &str, user_id: &str) -> Result<String> {
+    let store = CronStore::load()?;
+    let job = store
+        .get(job_id, channel, user_id)
+        .ok_or_else(|| anyhow::anyhow!("Job not found"))?;
+
+    let (response, _session_id) = claude::query_with_options(
+        &job.prompt,
+        QueryOptions {
+            skip_permissions: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    Ok(format!("[Cron: {}]\n\n{}", job.name, response))
+}
 
 /// Start sending periodic typing indicators until cancelled.
 /// Returns a sender that, when dropped or sent to, stops the typing loop.
@@ -192,9 +213,33 @@ async fn handle_message(
 
     // Check for commands first (works even during onboarding)
     let cmd_result = process_command(&mut store, "telegram", &user_id, text, onboarding_complete)?;
-    if let CommandResult::Response(response) = cmd_result {
-        bot.send_message(msg.chat.id, response).await?;
-        return Ok(());
+    match cmd_result {
+        CommandResult::Response(response) => {
+            bot.send_message(msg.chat.id, response).await?;
+            return Ok(());
+        }
+        CommandResult::CronRun(job_id) => {
+            // Execute cron job immediately
+            bot.send_message(msg.chat.id, "Running job...").await?;
+
+            // Start typing indicator
+            let typing_cancel = start_typing_indicator(bot.clone(), msg.chat.id);
+
+            // Execute the job
+            let result = execute_cron_job(&job_id, "telegram", &user_id).await;
+
+            // Stop typing
+            drop(typing_cancel);
+
+            // Send result
+            let response = match result {
+                Ok(output) => output,
+                Err(e) => format!("Job failed: {}", e),
+            };
+            bot.send_message(msg.chat.id, response).await?;
+            return Ok(());
+        }
+        CommandResult::NotACommand => {}
     }
 
     if !onboarding_complete {

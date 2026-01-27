@@ -19,10 +19,31 @@ use super::{
     CommandResult, UserTaskManager, handle_onboarding, process_command, query_claude_with_session,
     reindex_user_memories,
 };
+use crate::claude::{self, QueryOptions};
 use crate::config::{self, SignalConfig};
+use crate::cron::CronStore;
 use crate::onboarding;
 use crate::pairing::PairingStore;
 use crate::setup;
+
+/// Execute a cron job manually and return the output
+async fn execute_cron_job(job_id: &str, channel: &str, user_id: &str) -> Result<String> {
+    let store = CronStore::load()?;
+    let job = store
+        .get(job_id, channel, user_id)
+        .ok_or_else(|| anyhow!("Job not found"))?;
+
+    let (response, _session_id) = claude::query_with_options(
+        &job.prompt,
+        QueryOptions {
+            skip_permissions: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    Ok(format!("[Cron: {}]\n\n{}", job.name, response))
+}
 
 const DAEMON_PORT: u16 = 18080;
 const PID_FILE_NAME: &str = "cica-signal-daemon.pid";
@@ -508,11 +529,33 @@ async fn handle_message(
     let onboarding_complete = onboarding::is_complete_for_user("signal", &sender)?;
 
     // Check for commands first (works even during onboarding)
-    if let CommandResult::Response(response) =
-        process_command(&mut store, "signal", &sender, &text, onboarding_complete)?
-    {
-        send_message(&client, account, &sender, &response).await?;
-        return Ok(());
+    match process_command(&mut store, "signal", &sender, &text, onboarding_complete)? {
+        CommandResult::Response(response) => {
+            send_message(&client, account, &sender, &response).await?;
+            return Ok(());
+        }
+        CommandResult::CronRun(job_id) => {
+            // Execute cron job immediately
+            send_message(&client, account, &sender, "Running job...").await?;
+
+            // Start typing indicator
+            let typing_cancel = start_typing_indicator(client.clone(), sender.clone());
+
+            // Execute the job
+            let result = execute_cron_job(&job_id, "signal", &sender).await;
+
+            // Stop typing
+            drop(typing_cancel);
+
+            // Send result
+            let response = match result {
+                Ok(output) => output,
+                Err(e) => format!("Job failed: {}", e),
+            };
+            send_message(&client, account, &sender, &response).await?;
+            return Ok(());
+        }
+        CommandResult::NotACommand => {}
     }
 
     if !onboarding_complete {
