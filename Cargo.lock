@@ -413,6 +413,7 @@ name = "cica"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "croner",

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,41 +9,74 @@ use teloxide::types::{BotCommand, ChatAction, PhotoSize};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::config;
-
 use super::{
-    CommandResult, UserTaskManager, execute_cron_job, handle_onboarding, process_command,
-    query_claude_with_session, reindex_user_memories,
+    Channel, TypingGuard, UserTaskManager, build_text_with_images, determine_action,
+    execute_action, execute_claude_query,
 };
-use crate::config::TelegramConfig;
-use crate::onboarding;
+use crate::config::{self, TelegramConfig};
 use crate::pairing::PairingStore;
 
-/// Start sending periodic typing indicators until cancelled.
-/// Returns a sender that, when dropped or sent to, stops the typing loop.
-fn start_typing_indicator(bot: Bot, chat_id: ChatId) -> oneshot::Sender<()> {
-    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+// ============================================================================
+// Channel Implementation
+// ============================================================================
 
-    tokio::spawn(async move {
-        loop {
-            // Send typing indicator
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+/// Telegram channel implementation
+pub struct TelegramChannel {
+    bot: Bot,
+    chat_id: ChatId,
+}
 
-            // Wait 4 seconds or until cancelled (typing indicator lasts ~5s)
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(4)) => {
-                    // Continue loop, send typing again
-                }
-                _ = &mut cancel_rx => {
-                    // Cancelled, stop the loop
-                    break;
+impl TelegramChannel {
+    pub fn new(bot: Bot, chat_id: ChatId) -> Self {
+        Self { bot, chat_id }
+    }
+}
+
+#[async_trait]
+impl Channel for TelegramChannel {
+    fn name(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Telegram"
+    }
+
+    async fn send_message(&self, message: &str) -> Result<()> {
+        self.bot.send_message(self.chat_id, message).await?;
+        Ok(())
+    }
+
+    fn start_typing(&self) -> TypingGuard {
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+
+        tokio::spawn(async move {
+            loop {
+                // Send typing indicator
+                let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+
+                // Wait 4 seconds or until cancelled (typing indicator lasts ~5s)
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                        // Continue loop, send typing again
+                    }
+                    _ = &mut cancel_rx => {
+                        // Cancelled, stop the loop
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    cancel_tx
+        TypingGuard::new(cancel_tx)
+    }
 }
+
+// ============================================================================
+// Photo Handling
+// ============================================================================
 
 /// Get the directory where Telegram attachments are stored
 fn get_telegram_attachments_dir() -> Result<PathBuf> {
@@ -82,6 +116,10 @@ async fn download_photo(bot: &Bot, photo: &PhotoSize) -> Result<PathBuf> {
 fn get_largest_photo(photos: &[PhotoSize]) -> Option<&PhotoSize> {
     photos.iter().max_by_key(|p| p.width * p.height)
 }
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 /// Validate a Telegram bot token by calling getMe
 /// Returns the bot username on success
@@ -124,12 +162,17 @@ pub async fn run(config: TelegramConfig) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Message Handling
+// ============================================================================
+
 /// Handle an incoming message
 async fn handle_message(
     bot: &Bot,
     msg: &Message,
     task_manager: Arc<UserTaskManager>,
 ) -> Result<()> {
+    // Extract user info
     let user = msg.from.as_ref();
     let user_id = user.map(|u| u.id.0.to_string()).unwrap_or_default();
     let username = user.and_then(|u| u.username.clone());
@@ -138,27 +181,6 @@ async fn handle_message(
         None => u.first_name.clone(),
     });
 
-    // Check if user is approved
-    let mut store = PairingStore::load()?;
-
-    if !store.is_approved("telegram", &user_id) {
-        // Create or get existing pairing request
-        let (code, _is_new) =
-            store.get_or_create_pending("telegram", &user_id, username, display_name)?;
-
-        let response = format!(
-            "Hi! I don't recognize you yet.\n\n\
-            Pairing code: {}\n\n\
-            Ask the owner to run:\n\
-            cica approve {}",
-            code, code
-        );
-
-        bot.send_message(msg.chat.id, response).await?;
-        return Ok(());
-    }
-
-    // User is approved - process the message
     // Get text (either from text message or photo caption)
     let text = msg.text().or(msg.caption()).unwrap_or_default();
 
@@ -187,147 +209,35 @@ async fn handle_message(
         );
     }
 
-    // Check if onboarding is complete for this user
-    let onboarding_complete = onboarding::is_complete_for_user("telegram", &user_id)?;
+    // Create channel wrapper
+    let channel: Arc<dyn Channel> = Arc::new(TelegramChannel::new(bot.clone(), msg.chat.id));
 
-    // Check for commands first (works even during onboarding)
-    let cmd_result = process_command(&mut store, "telegram", &user_id, text, onboarding_complete)?;
-    match cmd_result {
-        CommandResult::Response(response) => {
-            bot.send_message(msg.chat.id, response).await?;
-            return Ok(());
-        }
-        CommandResult::CronRun(job_id) => {
-            // Execute cron job immediately
-            bot.send_message(msg.chat.id, "Running job...").await?;
+    // Determine what action to take
+    let mut store = PairingStore::load()?;
+    let action = determine_action(
+        channel.name(),
+        &user_id,
+        text,
+        &image_paths,
+        &mut store,
+        username,
+        display_name,
+    )?;
 
-            // Start typing indicator
-            let typing_cancel = start_typing_indicator(bot.clone(), msg.chat.id);
+    // Execute the action
+    if let Some(query_text) = execute_action(channel.as_ref(), &user_id, action).await? {
+        // QueryClaude action - queue with task manager for debouncing
+        let text_with_images = build_text_with_images(&query_text, &image_paths);
+        let user_key = format!("{}:{}", channel.name(), user_id);
+        let channel_clone = channel.clone();
+        let user_id_clone = user_id.clone();
 
-            // Execute the job
-            let result = execute_cron_job(&job_id, "telegram", &user_id).await;
-
-            // Stop typing
-            drop(typing_cancel);
-
-            // Send result
-            let response = match result {
-                Ok(output) => output,
-                Err(e) => format!("Job failed: {}", e),
-            };
-            bot.send_message(msg.chat.id, response).await?;
-            return Ok(());
-        }
-        CommandResult::NotACommand => {}
+        task_manager
+            .process_message(user_key, text_with_images, move |messages| async move {
+                execute_claude_query(channel_clone, &user_id_clone, messages).await;
+            })
+            .await;
     }
-
-    if !onboarding_complete {
-        // /start triggers onboarding greeting, not treated as an answer
-        let message = if text == "/start" { "hi" } else { text };
-
-        // Show typing indicator
-        let _ = bot.send_chat_action(msg.chat.id, ChatAction::Typing).await;
-
-        let response = handle_onboarding("telegram", &user_id, message).await?;
-        bot.send_message(msg.chat.id, response).await?;
-        return Ok(());
-    }
-
-    // Ignore /start after onboarding (already set up)
-    if text == "/start" {
-        return Ok(());
-    }
-
-    // Queue the message for processing with debounce and interruption support
-    let user_key = format!("telegram:{}", user_id);
-    let bot_clone = bot.clone();
-    let chat_id = msg.chat.id;
-    let user_id_clone = user_id.clone();
-
-    // Build the message text with image references
-    // Images are referenced using @path syntax which Claude Code understands
-    let mut text_with_images = text.to_string();
-    for (i, path) in image_paths.iter().enumerate() {
-        if let Some(path_str) = path.to_str() {
-            if text_with_images.is_empty() {
-                text_with_images = format!("@{}", path_str);
-            } else if i == 0 {
-                text_with_images = format!("{}\n\n@{}", text_with_images, path_str);
-            } else {
-                text_with_images = format!("{} @{}", text_with_images, path_str);
-            }
-        }
-    }
-
-    task_manager
-        .process_message(user_key, text_with_images, move |messages| async move {
-            // Combine multiple messages if batched
-            let combined_text = messages.join("\n\n");
-
-            // Start periodic typing indicator
-            let typing_cancel = start_typing_indicator(bot_clone.clone(), chat_id);
-
-            // Query Claude with context
-            let context_prompt = match onboarding::build_context_prompt_for_user(
-                Some("Telegram"),
-                Some("telegram"),
-                Some(&user_id_clone),
-                Some(&combined_text),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to build context prompt: {}", e);
-                    drop(typing_cancel);
-                    let _ = bot_clone
-                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
-                        .await;
-                    return;
-                }
-            };
-
-            let mut store = match PairingStore::load() {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to load pairing store: {}", e);
-                    drop(typing_cancel);
-                    let _ = bot_clone
-                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
-                        .await;
-                    return;
-                }
-            };
-
-            let (response, _session_id) = match query_claude_with_session(
-                &mut store,
-                "telegram",
-                &user_id_clone,
-                &combined_text,
-                context_prompt,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Claude query failed: {}", e);
-                    drop(typing_cancel);
-                    let _ = bot_clone
-                        .send_message(chat_id, format!("Sorry, I encountered an error: {}", e))
-                        .await;
-                    return;
-                }
-            };
-
-            // Stop typing indicator before sending response
-            drop(typing_cancel);
-
-            if let Err(e) = bot_clone.send_message(chat_id, response).await {
-                warn!("Failed to send message: {}", e);
-            }
-
-            // Re-index memories in case Claude saved new ones
-            reindex_user_memories("telegram", &user_id_clone);
-        })
-        .await;
 
     Ok(())
 }

@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 
 # Telegram bot
 teloxide = { version = "0.13", features = ["macros"] }

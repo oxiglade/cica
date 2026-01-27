@@ -2,10 +2,12 @@ pub mod signal;
 pub mod telegram;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -17,6 +19,291 @@ use crate::memory::MemoryIndex;
 use crate::onboarding;
 use crate::pairing::PairingStore;
 use crate::skills;
+
+// ============================================================================
+// Channel Abstraction
+// ============================================================================
+
+/// Abstraction over channel-specific transport operations.
+///
+/// Each channel (Telegram, Signal, etc.) implements this trait to provide
+/// a unified interface for sending messages and showing typing indicators.
+#[async_trait]
+pub trait Channel: Send + Sync + 'static {
+    /// Channel identifier (e.g., "telegram", "signal")
+    fn name(&self) -> &'static str;
+
+    /// Display name for user-facing messages (e.g., "Telegram", "Signal")
+    fn display_name(&self) -> &'static str;
+
+    /// Send a text message to the user
+    async fn send_message(&self, message: &str) -> Result<()>;
+
+    /// Start a typing indicator. Returns a guard that stops the indicator when dropped.
+    fn start_typing(&self) -> TypingGuard;
+}
+
+/// RAII guard for typing indicators.
+///
+/// The typing indicator runs until this guard is dropped.
+pub struct TypingGuard {
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl TypingGuard {
+    /// Create a new typing guard with a cancel channel
+    pub fn new(cancel: oneshot::Sender<()>) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+
+    /// Create a no-op guard (for testing or when typing indicators aren't supported)
+    #[allow(dead_code)]
+    pub fn noop() -> Self {
+        Self { cancel: None }
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+// ============================================================================
+// Message Actions
+// ============================================================================
+
+/// Actions that can result from processing an incoming message.
+///
+/// This enum represents "what to do" without "how to do it", enabling
+/// pure logic in `determine_action()` that's easy to test.
+pub enum MessageAction {
+    /// Send a simple response (command output, error message, etc.)
+    SendResponse(String),
+
+    /// Execute a cron job immediately
+    ExecuteCronJob { job_id: String },
+
+    /// Run onboarding flow with Claude
+    Onboarding { message: String },
+
+    /// Query Claude with the user's message
+    QueryClaude { text: String },
+
+    /// User not approved - send pairing instructions
+    NeedsPairing { code: String },
+
+    /// No action needed (empty message, /start after onboarding, etc.)
+    Ignore,
+}
+
+/// Determine what action to take for an incoming message.
+///
+/// This is a pure function with no side effects - it only reads state and
+/// returns what should happen. This makes it easy to test.
+pub fn determine_action(
+    channel: &str,
+    user_id: &str,
+    text: &str,
+    _image_paths: &[PathBuf],
+    store: &mut PairingStore,
+    username: Option<String>,
+    display_name: Option<String>,
+) -> Result<MessageAction> {
+    let text = text.trim();
+
+    // Check if user is approved
+    if !store.is_approved(channel, user_id) {
+        let (code, _is_new) =
+            store.get_or_create_pending(channel, user_id, username, display_name)?;
+        return Ok(MessageAction::NeedsPairing { code });
+    }
+
+    // Check if onboarding is complete
+    let onboarding_complete = onboarding::is_complete_for_user(channel, user_id)?;
+
+    // Process commands (work even during onboarding)
+    match process_command(store, channel, user_id, text, onboarding_complete)? {
+        CommandResult::Response(response) => {
+            return Ok(MessageAction::SendResponse(response));
+        }
+        CommandResult::CronRun(job_id) => {
+            return Ok(MessageAction::ExecuteCronJob { job_id });
+        }
+        CommandResult::NotACommand => {}
+    }
+
+    // Handle onboarding if not complete
+    if !onboarding_complete {
+        // Treat /start as "hi" for onboarding
+        let message = if text == "/start" { "hi" } else { text };
+        return Ok(MessageAction::Onboarding {
+            message: message.to_string(),
+        });
+    }
+
+    // Ignore /start after onboarding
+    if text == "/start" {
+        return Ok(MessageAction::Ignore);
+    }
+
+    // Empty message with no images - ignore
+    if text.is_empty() {
+        return Ok(MessageAction::Ignore);
+    }
+
+    // Normal message - query Claude
+    Ok(MessageAction::QueryClaude {
+        text: text.to_string(),
+    })
+}
+
+/// Build a message combining text and image paths.
+///
+/// Images are referenced using @path syntax which Claude Code understands.
+pub fn build_text_with_images(text: &str, image_paths: &[PathBuf]) -> String {
+    let mut result = text.to_string();
+
+    for (i, path) in image_paths.iter().enumerate() {
+        if let Some(path_str) = path.to_str() {
+            if result.is_empty() {
+                result = format!("@{}", path_str);
+            } else if i == 0 {
+                result = format!("{}\n\n@{}", result, path_str);
+            } else {
+                result = format!("{} @{}", result, path_str);
+            }
+        }
+    }
+
+    result
+}
+
+/// Execute an action that doesn't require the task manager.
+///
+/// Returns `Some(text)` if the action is QueryClaude (needs task_manager handling),
+/// otherwise executes the action and returns `None`.
+pub async fn execute_action(
+    channel: &dyn Channel,
+    user_id: &str,
+    action: MessageAction,
+) -> Result<Option<String>> {
+    match action {
+        MessageAction::SendResponse(response) => {
+            channel.send_message(&response).await?;
+            Ok(None)
+        }
+
+        MessageAction::NeedsPairing { code } => {
+            let response = format!(
+                "Hi! I don't recognize you yet.\n\n\
+                 Pairing code: {}\n\n\
+                 Ask the owner to run:\n\
+                 cica approve {}",
+                code, code
+            );
+            channel.send_message(&response).await?;
+            Ok(None)
+        }
+
+        MessageAction::ExecuteCronJob { job_id } => {
+            channel.send_message("Running job...").await?;
+            let _typing = channel.start_typing();
+            let result = execute_cron_job(&job_id, channel.name(), user_id).await;
+            let response = result.unwrap_or_else(|e| format!("Job failed: {}", e));
+            channel.send_message(&response).await?;
+            Ok(None)
+        }
+
+        MessageAction::Onboarding { message } => {
+            let _typing = channel.start_typing();
+            let response = handle_onboarding(channel.name(), user_id, &message).await?;
+            channel.send_message(&response).await?;
+            Ok(None)
+        }
+
+        MessageAction::QueryClaude { text } => {
+            // Return the text so caller can handle with task_manager
+            Ok(Some(text))
+        }
+
+        MessageAction::Ignore => Ok(None),
+    }
+}
+
+/// Execute a Claude query for the user.
+///
+/// This is called from within the task_manager callback after messages
+/// have been debounced and batched.
+pub async fn execute_claude_query(channel: Arc<dyn Channel>, user_id: &str, messages: Vec<String>) {
+    let combined_text = messages.join("\n\n");
+    let _typing = channel.start_typing();
+
+    // Build context prompt
+    let context_prompt = match onboarding::build_context_prompt_for_user(
+        Some(channel.display_name()),
+        Some(channel.name()),
+        Some(user_id),
+        Some(&combined_text),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Failed to build context prompt: {}", e);
+            let _ = channel
+                .send_message(&format!("Sorry, I encountered an error: {}", e))
+                .await;
+            return;
+        }
+    };
+
+    // Load pairing store for session management
+    let mut store = match PairingStore::load() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to load pairing store: {}", e);
+            let _ = channel
+                .send_message(&format!("Sorry, I encountered an error: {}", e))
+                .await;
+            return;
+        }
+    };
+
+    // Query Claude with session
+    let (response, _session_id) = match query_claude_with_session(
+        &mut store,
+        channel.name(),
+        user_id,
+        &combined_text,
+        context_prompt,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Claude query failed: {}", e);
+            let _ = channel
+                .send_message(&format!("Sorry, I encountered an error: {}", e))
+                .await;
+            return;
+        }
+    };
+
+    // Send response
+    if let Err(e) = channel.send_message(&response).await {
+        warn!("Failed to send message: {}", e);
+    }
+
+    // Re-index memories in case Claude saved new ones
+    reindex_user_memories(channel.name(), user_id);
+}
+
+// ============================================================================
+// Task Manager
+// ============================================================================
 
 /// Debounce duration for batching rapid messages
 const DEBOUNCE_MS: u64 = 200;

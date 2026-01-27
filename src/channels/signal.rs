@@ -1,6 +1,7 @@
 //! Signal channel implementation using signal-cli daemon
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -16,13 +17,86 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    CommandResult, UserTaskManager, execute_cron_job, handle_onboarding, process_command,
-    query_claude_with_session, reindex_user_memories,
+    Channel, TypingGuard, UserTaskManager, build_text_with_images, determine_action,
+    execute_action, execute_claude_query,
 };
 use crate::config::{self, SignalConfig};
-use crate::onboarding;
 use crate::pairing::PairingStore;
 use crate::setup;
+
+// ============================================================================
+// Channel Implementation
+// ============================================================================
+
+/// Signal channel implementation
+pub struct SignalChannel {
+    client: Arc<HttpClient>,
+    recipient: String,
+}
+
+impl SignalChannel {
+    pub fn new(client: Arc<HttpClient>, recipient: String) -> Self {
+        Self { client, recipient }
+    }
+}
+
+#[async_trait]
+impl Channel for SignalChannel {
+    fn name(&self) -> &'static str {
+        "signal"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Signal"
+    }
+
+    async fn send_message(&self, message: &str) -> Result<()> {
+        let mut params = ObjectParams::new();
+        params.insert("recipient", vec![self.recipient.as_str()])?;
+        params.insert("message", message)?;
+
+        let _: Value = self
+            .client
+            .request("send", params)
+            .await
+            .context("Failed to send message")?;
+
+        Ok(())
+    }
+
+    fn start_typing(&self) -> TypingGuard {
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let client = self.client.clone();
+        let recipient = self.recipient.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // Send typing indicator (lasts 15 seconds on Signal)
+                let mut params = ObjectParams::new();
+                if params.insert("recipient", vec![recipient.as_str()]).is_ok() {
+                    let _: Result<Value, _> = client.request("sendTyping", params).await;
+                }
+
+                // Wait 10 seconds or until cancelled
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(10)) => {
+                        // Continue loop, send typing again
+                    }
+                    _ = &mut cancel_rx => {
+                        // Cancelled, stop the loop
+                        break;
+                    }
+                }
+            }
+        });
+
+        TypingGuard::new(cancel_tx)
+    }
+}
+
+// ============================================================================
+// Daemon Management
+// ============================================================================
 
 const DAEMON_PORT: u16 = 18080;
 const PID_FILE_NAME: &str = "cica-signal-daemon.pid";
@@ -242,6 +316,10 @@ impl Drop for SignalDaemon {
     }
 }
 
+// ============================================================================
+// Message Types
+// ============================================================================
+
 /// Message received from Signal
 #[derive(Debug, Deserialize)]
 struct SignalMessage {
@@ -278,6 +356,10 @@ struct Attachment {
     size: Option<u64>,
 }
 
+// ============================================================================
+// Public API
+// ============================================================================
+
 /// Run the Signal bot
 pub async fn run(config: SignalConfig) -> Result<()> {
     info!("Starting Signal bot for {}...", config.phone_number);
@@ -298,7 +380,7 @@ pub async fn run(config: SignalConfig) -> Result<()> {
     let task_manager = UserTaskManager::new();
 
     // Set up graceful shutdown
-    let result = run_message_loop(client, &config.phone_number, task_manager).await;
+    let result = run_message_loop(client, task_manager).await;
 
     // Shutdown daemon gracefully
     daemon.shutdown().await;
@@ -306,19 +388,21 @@ pub async fn run(config: SignalConfig) -> Result<()> {
     result
 }
 
+// ============================================================================
+// Message Handling
+// ============================================================================
+
 /// Main message polling loop
 async fn run_message_loop(
     client: Arc<HttpClient>,
-    phone_number: &str,
     task_manager: Arc<UserTaskManager>,
 ) -> Result<()> {
     loop {
-        match receive_messages(&client, phone_number).await {
+        match receive_messages(&client).await {
             Ok(messages) => {
                 for msg in messages {
                     if let Err(e) =
-                        handle_message(client.clone(), phone_number, msg, Arc::clone(&task_manager))
-                            .await
+                        handle_message(client.clone(), msg, Arc::clone(&task_manager)).await
                     {
                         error!("Error handling message: {}", e);
                     }
@@ -335,7 +419,7 @@ async fn run_message_loop(
 }
 
 /// Receive pending messages
-async fn receive_messages(client: &HttpClient, _account: &str) -> Result<Vec<SignalMessage>> {
+async fn receive_messages(client: &HttpClient) -> Result<Vec<SignalMessage>> {
     // In single-account daemon mode, we don't pass account parameter
     let mut params = ObjectParams::new();
     params.insert("timeout", 1)?; // 1 second timeout
@@ -349,65 +433,6 @@ async fn receive_messages(client: &HttpClient, _account: &str) -> Result<Vec<Sig
     let messages: Vec<SignalMessage> = serde_json::from_value(result).unwrap_or_default();
 
     Ok(messages)
-}
-
-/// Send a message to a recipient
-async fn send_message(
-    client: &HttpClient,
-    _account: &str,
-    recipient: &str,
-    message: &str,
-) -> Result<()> {
-    // In single-account daemon mode, we don't pass account parameter
-    let mut params = ObjectParams::new();
-    params.insert("recipient", vec![recipient])?;
-    params.insert("message", message)?;
-
-    let _: Value = client
-        .request("send", params)
-        .await
-        .context("Failed to send message")?;
-
-    Ok(())
-}
-
-/// Send a typing indicator to a recipient
-async fn send_typing(client: &HttpClient, recipient: &str) -> Result<()> {
-    let mut params = ObjectParams::new();
-    params.insert("recipient", vec![recipient])?;
-
-    let _: Value = client
-        .request("sendTyping", params)
-        .await
-        .context("Failed to send typing indicator")?;
-
-    Ok(())
-}
-
-/// Start sending periodic typing indicators until cancelled.
-/// Returns a sender that, when dropped or sent to, stops the typing loop.
-fn start_typing_indicator(client: Arc<HttpClient>, recipient: String) -> oneshot::Sender<()> {
-    let (cancel_tx, mut cancel_rx) = oneshot::channel();
-
-    tokio::spawn(async move {
-        loop {
-            // Send typing indicator (lasts 15 seconds on Signal)
-            let _ = send_typing(&client, &recipient).await;
-
-            // Wait 10 seconds or until cancelled
-            tokio::select! {
-                _ = sleep(Duration::from_secs(10)) => {
-                    // Continue loop, send typing again
-                }
-                _ = &mut cancel_rx => {
-                    // Cancelled, stop the loop
-                    break;
-                }
-            }
-        }
-    });
-
-    cancel_tx
 }
 
 /// Get the path where signal-cli stores attachments
@@ -435,7 +460,6 @@ fn is_image_content_type(content_type: &str) -> bool {
 /// Handle an incoming message
 async fn handle_message(
     client: Arc<HttpClient>,
-    account: &str,
     msg: SignalMessage,
     task_manager: Arc<UserTaskManager>,
 ) -> Result<()> {
@@ -484,87 +508,6 @@ async fn handle_message(
     let display_name = envelope.source_name;
 
     info!("Message from {}: {}", sender, text);
-
-    // Check if user is approved
-    let mut store = PairingStore::load()?;
-
-    if !store.is_approved("signal", &sender) {
-        // Create or get existing pairing request
-        let (code, _) = store.get_or_create_pending("signal", &sender, None, display_name)?;
-
-        let response = format!(
-            "Hi! I don't recognize you yet.\n\n\
-            Pairing code: {}\n\n\
-            Ask the owner to run:\n\
-            cica approve {}",
-            code, code
-        );
-
-        send_message(&client, account, &sender, &response).await?;
-        return Ok(());
-    }
-
-    // Check if onboarding is complete for this user
-    let onboarding_complete = onboarding::is_complete_for_user("signal", &sender)?;
-
-    // Check for commands first (works even during onboarding)
-    match process_command(&mut store, "signal", &sender, &text, onboarding_complete)? {
-        CommandResult::Response(response) => {
-            send_message(&client, account, &sender, &response).await?;
-            return Ok(());
-        }
-        CommandResult::CronRun(job_id) => {
-            // Execute cron job immediately
-            send_message(&client, account, &sender, "Running job...").await?;
-
-            // Start typing indicator
-            let typing_cancel = start_typing_indicator(client.clone(), sender.clone());
-
-            // Execute the job
-            let result = execute_cron_job(&job_id, "signal", &sender).await;
-
-            // Stop typing
-            drop(typing_cancel);
-
-            // Send result
-            let response = match result {
-                Ok(output) => output,
-                Err(e) => format!("Job failed: {}", e),
-            };
-            send_message(&client, account, &sender, &response).await?;
-            return Ok(());
-        }
-        CommandResult::NotACommand => {}
-    }
-
-    if !onboarding_complete {
-        let response = handle_onboarding("signal", &sender, &text).await?;
-        send_message(&client, account, &sender, &response).await?;
-        return Ok(());
-    }
-
-    // Queue the message for processing with debounce and interruption support
-    let user_key = format!("signal:{}", sender);
-    let client_clone = client.clone();
-    let account_owned = account.to_string();
-    let sender_clone = sender.clone();
-
-    // Build the message text with image references
-    // Images are referenced using @path syntax which Claude Code understands
-    let mut text_with_images = text.clone();
-    for (i, path) in image_paths.iter().enumerate() {
-        if let Some(path_str) = path.to_str() {
-            if text_with_images.is_empty() {
-                text_with_images = format!("@{}", path_str);
-            } else if i == 0 {
-                text_with_images = format!("{}\n\n@{}", text_with_images, path_str);
-            } else {
-                text_with_images = format!("{} @{}", text_with_images, path_str);
-            }
-        }
-    }
-
-    // Log that we're processing images
     if !image_paths.is_empty() {
         info!(
             "Message includes {} image(s): {:?}",
@@ -573,92 +516,42 @@ async fn handle_message(
         );
     }
 
-    task_manager
-        .process_message(user_key, text_with_images, move |messages| async move {
-            // Combine multiple messages if batched
-            let combined_text = messages.join("\n\n");
+    // Create channel wrapper
+    let channel: Arc<dyn Channel> = Arc::new(SignalChannel::new(client, sender.clone()));
 
-            // Start periodic typing indicator
-            let typing_cancel = start_typing_indicator(client_clone.clone(), sender_clone.clone());
+    // Determine what action to take
+    let mut store = PairingStore::load()?;
+    let action = determine_action(
+        channel.name(),
+        &sender,
+        &text,
+        &image_paths,
+        &mut store,
+        None, // Signal doesn't have usernames
+        display_name,
+    )?;
 
-            // Query Claude with context
-            let context_prompt = match onboarding::build_context_prompt_for_user(
-                Some("Signal"),
-                Some("signal"),
-                Some(&sender_clone),
-                Some(&combined_text),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to build context prompt: {}", e);
-                    drop(typing_cancel);
-                    let _ = send_message(
-                        &client_clone,
-                        &account_owned,
-                        &sender_clone,
-                        &format!("Sorry, I encountered an error: {}", e),
-                    )
-                    .await;
-                    return;
-                }
-            };
+    // Execute the action
+    if let Some(query_text) = execute_action(channel.as_ref(), &sender, action).await? {
+        // QueryClaude action - queue with task manager for debouncing
+        let text_with_images = build_text_with_images(&query_text, &image_paths);
+        let user_key = format!("{}:{}", channel.name(), sender);
+        let channel_clone = channel.clone();
+        let sender_clone = sender.clone();
 
-            let mut store = match PairingStore::load() {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to load pairing store: {}", e);
-                    drop(typing_cancel);
-                    let _ = send_message(
-                        &client_clone,
-                        &account_owned,
-                        &sender_clone,
-                        &format!("Sorry, I encountered an error: {}", e),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            let (response, _session_id) = match query_claude_with_session(
-                &mut store,
-                "signal",
-                &sender_clone,
-                &combined_text,
-                context_prompt,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Claude query failed: {}", e);
-                    drop(typing_cancel);
-                    let _ = send_message(
-                        &client_clone,
-                        &account_owned,
-                        &sender_clone,
-                        &format!("Sorry, I encountered an error: {}", e),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            // Stop typing indicator before sending response
-            drop(typing_cancel);
-
-            if let Err(e) =
-                send_message(&client_clone, &account_owned, &sender_clone, &response).await
-            {
-                warn!("Failed to send message: {}", e);
-            }
-
-            // Re-index memories in case Claude saved new ones
-            reindex_user_memories("signal", &sender_clone);
-        })
-        .await;
+        task_manager
+            .process_message(user_key, text_with_images, move |messages| async move {
+                execute_claude_query(channel_clone, &sender_clone, messages).await;
+            })
+            .await;
+    }
 
     Ok(())
 }
+
+// ============================================================================
+// Registration
+// ============================================================================
 
 /// Result of registration attempt
 pub enum RegistrationResult {
