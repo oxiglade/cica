@@ -232,11 +232,12 @@ async fn execute_job<C: Clock>(
 
     let start_time = clock.now_millis();
 
-    // Mark as running
+    // Mark as running and clear next_run_at to prevent duplicate execution
     {
         let mut store = store.lock().await;
         if let Some(job) = store.get_mut(&job_id) {
             job.state.last_status = JobStatus::Running;
+            job.state.next_run_at = None; // Prevent re-triggering while running
         }
         let _ = store.save();
     }
