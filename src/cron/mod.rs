@@ -93,6 +93,16 @@ impl<C: Clock> CronService<C> {
                         break;
                     }
                     _ = clock.sleep(tick_interval) => {
+                        // Reload store from disk to pick up external changes
+                        // (e.g., agent modifying cron.json directly)
+                        {
+                            let mut store_guard = store.lock().await;
+                            match CronStore::load() {
+                                Ok(fresh) => *store_guard = fresh,
+                                Err(e) => warn!("Failed to reload cron store: {}", e),
+                            }
+                        }
+
                         // Check for due jobs
                         let now = clock.now_millis();
                         let due_jobs = {
