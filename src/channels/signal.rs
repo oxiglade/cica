@@ -364,42 +364,68 @@ struct Attachment {
 pub async fn run(config: SignalConfig) -> Result<()> {
     info!("Starting Signal bot for {}...", config.phone_number);
 
-    // Start the signal-cli daemon
-    let mut daemon = SignalDaemon::start(&config.phone_number).await?;
-
-    // Create JSON-RPC client
-    let client = Arc::new(
-        HttpClientBuilder::default()
-            .build(daemon.rpc_url())
-            .context("Failed to create JSON-RPC client")?,
-    );
-
-    info!("Signal bot running. Listening for messages...");
-
-    // Create shared task manager for per-user message handling
+    // Create shared task manager for per-user message handling (persists across restarts)
     let task_manager = UserTaskManager::new();
 
-    // Set up graceful shutdown
-    let result = run_message_loop(client, task_manager).await;
+    // Outer loop for daemon recovery
+    loop {
+        // Start the signal-cli daemon
+        let mut daemon = match SignalDaemon::start(&config.phone_number).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to start signal-cli daemon: {:#}", e);
+                info!("Retrying in 10 seconds...");
+                sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
 
-    // Shutdown daemon gracefully
-    daemon.shutdown().await;
+        // Create JSON-RPC client with longer timeouts to handle contention
+        let client = Arc::new(
+            HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(30))
+                .build(daemon.rpc_url())
+                .context("Failed to create JSON-RPC client")?,
+        );
 
-    result
+        info!("Signal bot running. Listening for messages...");
+
+        // Run message loop until it signals a restart is needed
+        let needs_restart = run_message_loop(client, Arc::clone(&task_manager)).await;
+
+        // Shutdown daemon gracefully
+        daemon.shutdown().await;
+
+        if needs_restart {
+            warn!("Restarting signal-cli daemon due to repeated failures...");
+            sleep(Duration::from_secs(2)).await;
+        } else {
+            // Clean exit requested
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
 // Message Handling
 // ============================================================================
 
+/// Maximum consecutive receive failures before restarting daemon
+const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
 /// Main message polling loop
-async fn run_message_loop(
-    client: Arc<HttpClient>,
-    task_manager: Arc<UserTaskManager>,
-) -> Result<()> {
+/// Returns true if daemon should be restarted, false for clean exit
+async fn run_message_loop(client: Arc<HttpClient>, task_manager: Arc<UserTaskManager>) -> bool {
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         match receive_messages(&client).await {
             Ok(messages) => {
+                // Reset failure counter on success
+                consecutive_failures = 0;
+
                 for msg in messages {
                     if let Err(e) =
                         handle_message(client.clone(), msg, Arc::clone(&task_manager)).await
@@ -409,7 +435,19 @@ async fn run_message_loop(
                 }
             }
             Err(e) => {
-                warn!("Error receiving messages: {}", e);
+                consecutive_failures += 1;
+                warn!(
+                    "Error receiving messages ({}/{}): {:#}",
+                    consecutive_failures, MAX_CONSECUTIVE_FAILURES, e
+                );
+
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    error!(
+                        "Too many consecutive receive failures ({}), triggering daemon restart",
+                        consecutive_failures
+                    );
+                    return true; // Signal restart needed
+                }
             }
         }
 
