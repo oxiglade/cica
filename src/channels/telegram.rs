@@ -47,6 +47,49 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    async fn send_message_with_attachments(
+        &self,
+        message: &str,
+        attachment_paths: &[PathBuf],
+    ) -> Result<()> {
+        use teloxide::types::InputFile;
+
+        // If no attachments, just send the text message
+        if attachment_paths.is_empty() {
+            return self.send_message(message).await;
+        }
+
+        // Send images as photos
+        for path in attachment_paths {
+            if !path.exists() {
+                warn!("Attachment path does not exist: {:?}", path);
+                continue;
+            }
+
+            // Create InputFile from path
+            let input_file = InputFile::file(path);
+
+            // Send the photo with the message as caption (only on first photo)
+            if path == attachment_paths.first().unwrap() && !message.is_empty() {
+                // First photo gets the caption
+                self.bot
+                    .send_photo(self.chat_id, input_file)
+                    .caption(message)
+                    .await?;
+            } else {
+                // Subsequent photos without caption
+                self.bot.send_photo(self.chat_id, input_file).await?;
+            }
+        }
+
+        // If message exists but all photos failed, send just the text
+        if !message.is_empty() && attachment_paths.iter().all(|p| !p.exists()) {
+            self.send_message(message).await?;
+        }
+
+        Ok(())
+    }
+
     fn start_typing(&self) -> TypingGuard {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let bot = self.bot.clone();

@@ -51,9 +51,26 @@ impl Channel for SignalChannel {
     }
 
     async fn send_message(&self, message: &str) -> Result<()> {
+        self.send_message_with_attachments(message, &[]).await
+    }
+
+    async fn send_message_with_attachments(
+        &self,
+        message: &str,
+        attachment_paths: &[PathBuf],
+    ) -> Result<()> {
         let mut params = ObjectParams::new();
         params.insert("recipient", vec![self.recipient.as_str()])?;
         params.insert("message", message)?;
+
+        // Add attachments if any
+        if !attachment_paths.is_empty() {
+            let attachment_strings: Vec<String> = attachment_paths
+                .iter()
+                .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                .collect();
+            params.insert("attachments", attachment_strings)?;
+        }
 
         let _: Value = self
             .client

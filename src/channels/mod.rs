@@ -39,6 +39,17 @@ pub trait Channel: Send + Sync + 'static {
     /// Send a text message to the user
     async fn send_message(&self, message: &str) -> Result<()>;
 
+    /// Send a message with attachments (images, files, etc.)
+    async fn send_message_with_attachments(
+        &self,
+        message: &str,
+        _attachment_paths: &[PathBuf],
+    ) -> Result<()> {
+        // Default implementation: just send the text message (ignore attachments)
+        // Channels that support attachments should override this
+        self.send_message(message).await
+    }
+
     /// Start a typing indicator. Returns a guard that stops the indicator when dropped.
     fn start_typing(&self) -> TypingGuard;
 }
@@ -235,6 +246,62 @@ pub async fn execute_action(
     }
 }
 
+/// Extract image paths from Claude's response text.
+///
+/// Looks for file paths in the response that point to image files.
+/// Specifically looks for paths in the skills/nano-banana/generated/ directory.
+fn extract_image_attachments(response: &str) -> Vec<PathBuf> {
+    let mut attachments = Vec::new();
+
+    // Look for file paths that end in image extensions
+    let image_extensions = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+
+    for line in response.lines() {
+        let line = line.trim();
+
+        // Check if line contains a file path
+        for ext in &image_extensions {
+            if line.contains(ext) {
+                // Try to extract the path - look for paths starting with /Users/
+                if let Some(start) = line.find("/Users/") {
+                    // Find the end of the extension (not whitespace, since paths can have spaces)
+                    if let Some(ext_pos) = line[start..].find(ext) {
+                        let end_pos = start + ext_pos + ext.len();
+                        let path_str = &line[start..end_pos];
+                        if std::path::Path::new(path_str).exists() {
+                            attachments.push(PathBuf::from(path_str));
+                            break; // Found the image on this line, move to next line
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    attachments
+}
+
+/// Remove lines from the response that contain file paths.
+///
+/// This cleans up responses to avoid showing technical file paths to the user
+/// when images are being sent as attachments.
+fn remove_file_path_lines(response: &str) -> String {
+    let lines: Vec<&str> = response
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Skip lines that contain /Users/ (file paths)
+            // Skip lines that are just "The image has been saved to:" or similar
+            !trimmed.contains("/Users/")
+                && !trimmed.to_lowercase().contains("saved to")
+                && !trimmed.to_lowercase().contains("image has been saved")
+                && !trimmed.is_empty()
+        })
+        .collect();
+
+    lines.join("\n").trim().to_string()
+}
+
 /// Execute a Claude query for the user.
 ///
 /// This is called from within the task_manager callback after messages
@@ -292,9 +359,24 @@ pub async fn execute_claude_query(channel: Arc<dyn Channel>, user_id: &str, mess
         }
     };
 
-    // Send response
-    if let Err(e) = channel.send_message(&response).await {
-        warn!("Failed to send message: {}", e);
+    // Extract any image attachments from the response
+    let attachments = extract_image_attachments(&response);
+
+    // Send response with attachments if any
+    if !attachments.is_empty() {
+        debug!("Sending response with {} attachment(s)", attachments.len());
+
+        // Clean up the response text - remove lines that mention the file paths
+        let cleaned_response = remove_file_path_lines(&response);
+
+        if let Err(e) = channel.send_message_with_attachments(&cleaned_response, &attachments).await {
+            warn!("Failed to send message with attachments: {}", e);
+        }
+    } else {
+        // Send regular text message
+        if let Err(e) = channel.send_message(&response).await {
+            warn!("Failed to send message: {}", e);
+        }
     }
 
     // Re-index memories in case Claude saved new ones
