@@ -15,6 +15,34 @@ use crate::config::SlackConfig;
 use crate::pairing::PairingStore;
 
 // ============================================================================
+// Markdown to Slack mrkdwn conversion
+// ============================================================================
+
+/// Convert standard Markdown to Slack's mrkdwn format
+fn markdown_to_mrkdwn(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // Convert bold: **text** -> *text*
+    // Be careful not to convert already-correct single asterisks
+    // Use a simple approach: replace ** with a placeholder, then convert
+    result = result.replace("**", "\x00BOLD\x00");
+    result = result.replace("\x00BOLD\x00", "*");
+
+    // Convert italic: *text* -> _text_ (but only single asterisks not part of bold)
+    // This is tricky because * is used for bold in mrkdwn
+    // Skip this for now as it can conflict with bullet points
+
+    // Convert links: [text](url) -> <url|text>
+    let link_re = regex_lite::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
+    result = link_re.replace_all(&result, "<$2|$1>").to_string();
+
+    // Convert inline code: `code` stays the same in Slack
+    // Convert code blocks: ```code``` stays the same in Slack
+
+    result
+}
+
+// ============================================================================
 // Channel Implementation
 // ============================================================================
 
@@ -61,10 +89,13 @@ impl Channel for SlackChannel {
         );
         let session = self.client.open_session(&self.token);
 
+        // Convert markdown to Slack's mrkdwn format
+        let mrkdwn_message = markdown_to_mrkdwn(message);
+
         // Build request with thread_ts if available (required for AI Assistant apps)
         let mut request = SlackApiChatPostMessageRequest::new(
             self.channel_id.clone(),
-            SlackMessageContent::new().with_text(message.to_string()),
+            SlackMessageContent::new().with_text(mrkdwn_message),
         );
 
         // Reply in the thread if we have a thread_ts

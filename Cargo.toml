@@ -70,3 +70,6 @@ http-body-util = "0.1"
 
 # TLS (needed for slack-morphism)
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+# Lightweight regex for Slack markdown conversion
+regex-lite = "0.1"
