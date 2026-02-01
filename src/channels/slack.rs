@@ -386,19 +386,29 @@ async fn handle_push_events(
                 .get_user_state::<SlackUserState>()
                 .ok_or("Missing user state")?;
 
-            if let Err(e) = handle_message_event(
-                msg_event,
-                client,
-                user_state.bot_token.clone(),
-                user_state.bot_token_str.clone(),
-                user_state.bot_user_id.clone(),
-                user_state.task_manager.clone(),
-                user_state.user_threads.clone(),
-            )
-            .await
-            {
-                warn!("Error handling Slack message: {}", e);
-            }
+            // Spawn message handling in background so we ack the event immediately
+            // This prevents Slack from retrying delivery
+            let bot_token = user_state.bot_token.clone();
+            let bot_token_str = user_state.bot_token_str.clone();
+            let bot_user_id = user_state.bot_user_id.clone();
+            let task_manager = user_state.task_manager.clone();
+            let user_threads = user_state.user_threads.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_message_event(
+                    msg_event,
+                    client,
+                    bot_token,
+                    bot_token_str,
+                    bot_user_id,
+                    task_manager,
+                    user_threads,
+                )
+                .await
+                {
+                    warn!("Error handling Slack message: {}", e);
+                }
+            });
         }
         _ => {
             debug!("Ignoring event type: {:?}", event);
@@ -470,10 +480,12 @@ async fn handle_message_event(
     }
 
     info!(
-        "Message from {} in channel {} (thread: {:?}): {}{}",
+        "Message from {} in channel {} (thread: {:?}, ts: {}, subtype: {:?}): {}{}",
         user_id,
         channel_id,
         thread_ts,
+        event.origin.ts,
+        event.subtype,
         text,
         if image_paths.is_empty() {
             String::new()
