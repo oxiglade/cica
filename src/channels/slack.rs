@@ -93,13 +93,13 @@ async fn set_suggested_prompts(
         "What can you help me with?".to_string(),
     ));
 
-    // Add skills as prompts
+    // Add skills as prompts using their descriptions
     if let Ok(available_skills) = skills::discover_skills() {
         for skill in available_skills.iter().take(3) {
             // Leave room for default prompt
             prompts.push(SlackAssistantPrompt::new(
-                skill.name.clone(),
-                format!("Help me with {}", skill.name),
+                skill.description.clone(), // e.g., "Get latest assessment statistics"
+                skill.description.clone(), // Send the description as the message
             ));
         }
     }
