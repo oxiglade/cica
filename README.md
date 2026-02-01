@@ -75,10 +75,14 @@ flowchart LR
         MEM[(Memory)] --> PB
         SK[Skills] --> PB
         Channels --> PB[Prompt Builder]
-        PB --> CC[Claude Code]
+        subgraph Backends
+            CC[Claude Code]
+            CU[Cursor]
+        end
+        PB --> Backends
     end
     
-    CC --> Tools[Web / Files / Shell]
+    Backends --> Tools[Web / Files / Shell]
 ```
 
 ## License
