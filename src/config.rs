@@ -130,6 +130,9 @@ pub struct Config {
     /// Which AI backend to use (claude or cursor)
     #[serde(default)]
     pub backend: AiBackend,
+
+    /// Global onboarding prompt (can be overridden per channel)
+    pub onboarding_prompt: Option<String>,
 }
 
 /// All channel configurations
@@ -149,6 +152,7 @@ pub struct TelegramConfig {
     pub auto_approve: bool,
     #[serde(default)]
     pub shared_identity: bool,
+    pub onboarding_prompt: Option<String>,
 }
 
 impl TelegramConfig {
@@ -169,6 +173,7 @@ pub struct SignalConfig {
     pub auto_approve: bool,
     #[serde(default)]
     pub shared_identity: bool,
+    pub onboarding_prompt: Option<String>,
 }
 
 impl SignalConfig {
@@ -191,6 +196,7 @@ pub struct SlackConfig {
     pub auto_approve: bool,
     #[serde(default)]
     pub shared_identity: bool,
+    pub onboarding_prompt: Option<String>,
 }
 
 impl SlackConfig {
@@ -208,10 +214,13 @@ impl SlackConfig {
 pub struct ChannelSettings {
     pub auto_approve: bool,
     pub shared_identity: bool,
+    pub onboarding_prompt: Option<String>,
 }
 
 impl Config {
     pub fn channel_settings(&self, channel: &str) -> ChannelSettings {
+        let global_prompt = self.onboarding_prompt.clone();
+
         match channel {
             "telegram" => self
                 .channels
@@ -220,6 +229,7 @@ impl Config {
                 .map(|c| ChannelSettings {
                     auto_approve: c.auto_approve,
                     shared_identity: c.shared_identity,
+                    onboarding_prompt: c.onboarding_prompt.clone().or(global_prompt.clone()),
                 })
                 .unwrap_or_default(),
             "signal" => self
@@ -229,6 +239,7 @@ impl Config {
                 .map(|c| ChannelSettings {
                     auto_approve: c.auto_approve,
                     shared_identity: c.shared_identity,
+                    onboarding_prompt: c.onboarding_prompt.clone().or(global_prompt.clone()),
                 })
                 .unwrap_or_default(),
             "slack" => self
@@ -238,6 +249,7 @@ impl Config {
                 .map(|c| ChannelSettings {
                     auto_approve: c.auto_approve,
                     shared_identity: c.shared_identity,
+                    onboarding_prompt: c.onboarding_prompt.clone().or(global_prompt.clone()),
                 })
                 .unwrap_or_default(),
             _ => ChannelSettings::default(),

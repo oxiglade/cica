@@ -139,11 +139,21 @@ IMPORTANT: Do NOT write the file until you have all three answers."#,
     ))
 }
 
+const DEFAULT_ONBOARDING_PROMPT: &str = "Tell me about yourself - the more I know about you the better I'll be able to help, so don't be shy!";
+
 /// System prompt for user profile phase (per-user)
 fn user_system_prompt(channel: &str, user_id: &str) -> Result<String> {
     let identity_path = identity_path_for_user(channel, user_id)?;
     let user_path = user_path_for_user(channel, user_id)?;
     let identity = std::fs::read_to_string(&identity_path).unwrap_or_default();
+
+    let settings = config::Config::load()
+        .map(|c| c.channel_settings(channel))
+        .unwrap_or_default();
+
+    let onboarding_prompt = settings
+        .onboarding_prompt
+        .unwrap_or_else(|| DEFAULT_ONBOARDING_PROMPT.to_string());
 
     Ok(format!(
         r#"You are an AI assistant with this identity:
@@ -152,8 +162,8 @@ fn user_system_prompt(channel: &str, user_id: &str) -> Result<String> {
 
 You just finished setting up your identity. Now ask the user to tell you about themselves.
 
-Keep it casual and short. Example:
-"Now tell me about yourself - the more I know about you the better I'll be able to help, so don't be shy!"
+Keep it casual and short. Use this prompt:
+"{}"
 
 When they respond, write their info to: {}
 
@@ -172,6 +182,7 @@ IMPORTANT:
 - Do NOT ask follow-up questions about their profile
 - After saving, just move on to helping them"#,
         identity,
+        onboarding_prompt,
         user_path.display()
     ))
 }
