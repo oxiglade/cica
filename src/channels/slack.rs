@@ -98,8 +98,8 @@ async fn set_suggested_prompts(
         for skill in available_skills.iter().take(3) {
             // Leave room for default prompt
             prompts.push(SlackAssistantPrompt::new(
-                skill.description.clone(), // e.g., "Get latest assessment statistics"
-                skill.description.clone(), // Send the description as the message
+                skill.description.clone(),
+                skill.description.clone(),
             ));
         }
     }
@@ -425,6 +425,32 @@ async fn handle_push_events(
                 set_suggested_prompts(&client, &token, &channel_id, &thread_ts).await;
             });
         }
+        SlackEventCallbackBody::AppMention(mention_event) => {
+            let states = user_state_storage.read().await;
+            let user_state = states
+                .get_user_state::<SlackUserState>()
+                .ok_or("Missing user state")?;
+
+            let bot_token = user_state.bot_token.clone();
+            let bot_token_str = user_state.bot_token_str.clone();
+            let task_manager = user_state.task_manager.clone();
+            let user_threads = user_state.user_threads.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_app_mention_event(
+                    mention_event,
+                    client,
+                    bot_token,
+                    bot_token_str,
+                    task_manager,
+                    user_threads,
+                )
+                .await
+                {
+                    warn!("Error handling Slack app mention: {}", e);
+                }
+            });
+        }
         _ => {
             debug!("Ignoring event type: {:?}", event);
         }
@@ -578,6 +604,117 @@ async fn handle_message_event(
         task_manager
             .process_message(user_key, text_with_images, move |messages| async move {
                 // Use session_user_id so each thread gets its own Claude session
+                execute_claude_query(channel_clone, &session_user_id_clone, messages).await;
+            })
+            .await;
+    }
+
+    Ok(())
+}
+
+/// Handle @mention events in channels
+async fn handle_app_mention_event(
+    event: SlackAppMentionEvent,
+    client: Arc<SlackHyperClient>,
+    token: SlackApiToken,
+    bot_token_str: String,
+    task_manager: Arc<UserTaskManager>,
+    user_threads: Arc<RwLock<HashMap<String, String>>>,
+) -> Result<()> {
+    let user_id = event.user.clone();
+    let channel_id = event.channel.clone();
+
+    // Get message text and strip the @mention
+    let text = event
+        .content
+        .text
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    // Skip empty messages
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    // Determine thread_ts: if this is a reply in a thread, use that thread
+    // Otherwise, use this message's ts to start a new thread
+    let thread_ts = event
+        .origin
+        .thread_ts
+        .clone()
+        .unwrap_or_else(|| event.origin.ts.clone());
+
+    info!(
+        "App mention from {} in channel {} (thread: {}): {}",
+        user_id, channel_id, thread_ts, text
+    );
+
+    // Track thread for session management
+    {
+        let ts_str = thread_ts.to_string();
+        let mut threads = user_threads.write().await;
+        let previous_thread = threads.insert(user_id.to_string(), ts_str.clone());
+
+        if previous_thread.as_ref() != Some(&ts_str) {
+            info!(
+                "User {} started/joined thread {} in channel {}",
+                user_id, ts_str, channel_id
+            );
+        }
+    }
+
+    // Download any image files in the message
+    let mut image_paths: Vec<PathBuf> = Vec::new();
+    if let Some(files) = &event.content.files {
+        for file in files {
+            if is_image_file(file) {
+                match download_slack_file(file, &bot_token_str).await {
+                    Ok(path) => image_paths.push(path),
+                    Err(e) => warn!("Failed to download Slack file: {}", e),
+                }
+            }
+        }
+    }
+
+    // Get user info for display name
+    let (username, display_name) = get_user_info(&client, &token, &user_id).await;
+
+    // Create channel wrapper - always reply in thread
+    let channel: Arc<dyn Channel> = Arc::new(SlackChannel::new(
+        client.clone(),
+        token.clone(),
+        channel_id.clone(),
+        Some(thread_ts.clone()),
+    ));
+
+    // Session key includes thread for continuity
+    let user_id_str = user_id.to_string();
+    let session_user_id = format!("{}:{}", user_id, thread_ts);
+
+    // Determine what action to take
+    let mut store = PairingStore::load()?;
+
+    let action = determine_action(
+        channel.name(),
+        &user_id_str,
+        &text,
+        &image_paths,
+        &mut store,
+        username,
+        display_name,
+    )?;
+
+    // Execute the action
+    if let Some(query_text) = execute_action(channel.as_ref(), &user_id_str, action).await? {
+        let text_with_images = build_text_with_images(&query_text, &image_paths);
+        let user_key = format!("{}:{}", channel.name(), session_user_id);
+        let channel_clone = channel.clone();
+        let session_user_id_clone = session_user_id.clone();
+
+        task_manager
+            .process_message(user_key, text_with_images, move |messages| async move {
                 execute_claude_query(channel_clone, &session_user_id_clone, messages).await;
             })
             .await;
