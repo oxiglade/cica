@@ -651,6 +651,44 @@ async fn handle_app_mention_event(
         user_id, channel_id, thread_ts, text
     );
 
+    // Check if user is approved before proceeding
+    let user_id_str = user_id.to_string();
+    let mut store = PairingStore::load()?;
+
+    if !store.is_approved("slack", &user_id_str) {
+        let settings = crate::config::Config::load()
+            .map(|c: crate::config::Config| c.channel_settings("slack"))
+            .unwrap_or_default();
+
+        if !settings.auto_approve {
+            send_ephemeral_message(
+                &client,
+                &token,
+                &channel_id,
+                &user_id,
+                "Hi! I don't recognize you yet. Please send me a direct message to get started.",
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Auto-approve the user
+        let (username, display_name) = get_user_info(&client, &token, &user_id).await;
+        store.auto_approve("slack", &user_id_str, username, display_name)?;
+    }
+
+    let onboarding_complete = crate::onboarding::is_complete_for_user("slack", &user_id_str)?;
+    if !onboarding_complete {
+        send_ephemeral_message(
+            &client,
+            &token,
+            &channel_id,
+            &user_id,
+            "Tip: Send me a direct message to set up your profile for more personalized responses.",
+        )
+        .await;
+    }
+
     // Track thread for session management
     {
         let ts_str = thread_ts.to_string();
@@ -678,9 +716,6 @@ async fn handle_app_mention_event(
         }
     }
 
-    // Get user info for display name
-    let (username, display_name) = get_user_info(&client, &token, &user_id).await;
-
     // Create channel wrapper - always reply in thread
     let channel: Arc<dyn Channel> = Arc::new(SlackChannel::new(
         client.clone(),
@@ -690,37 +725,41 @@ async fn handle_app_mention_event(
     ));
 
     // Session key includes thread for continuity
-    let user_id_str = user_id.to_string();
     let session_user_id = format!("{}:{}", user_id, thread_ts);
 
-    // Determine what action to take
-    let mut store = PairingStore::load()?;
+    let text_with_images = build_text_with_images(&text, &image_paths);
+    let user_key = format!("{}:{}", channel.name(), session_user_id);
+    let channel_clone = channel.clone();
+    let session_user_id_clone = session_user_id.clone();
 
-    let action = determine_action(
-        channel.name(),
-        &user_id_str,
-        &text,
-        &image_paths,
-        &mut store,
-        username,
-        display_name,
-    )?;
-
-    // Execute the action
-    if let Some(query_text) = execute_action(channel.as_ref(), &user_id_str, action).await? {
-        let text_with_images = build_text_with_images(&query_text, &image_paths);
-        let user_key = format!("{}:{}", channel.name(), session_user_id);
-        let channel_clone = channel.clone();
-        let session_user_id_clone = session_user_id.clone();
-
-        task_manager
-            .process_message(user_key, text_with_images, move |messages| async move {
-                execute_claude_query(channel_clone, &session_user_id_clone, messages).await;
-            })
-            .await;
-    }
+    task_manager
+        .process_message(user_key, text_with_images, move |messages| async move {
+            execute_claude_query(channel_clone, &session_user_id_clone, messages).await;
+        })
+        .await;
 
     Ok(())
+}
+
+/// Send an ephemeral message visible only to a specific user
+async fn send_ephemeral_message(
+    client: &Arc<SlackHyperClient>,
+    token: &SlackApiToken,
+    channel_id: &SlackChannelId,
+    user_id: &SlackUserId,
+    message: &str,
+) {
+    let session = client.open_session(token);
+
+    let request = SlackApiChatPostEphemeralRequest::new(
+        channel_id.clone(),
+        user_id.clone(),
+        SlackMessageContent::new().with_text(message.to_string()),
+    );
+
+    if let Err(e) = session.chat_post_ephemeral(&request).await {
+        warn!("Failed to send ephemeral message: {}", e);
+    }
 }
 
 /// Get user info from Slack API
