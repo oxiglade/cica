@@ -160,6 +160,21 @@ impl PairingStore {
         Ok(request)
     }
 
+    /// Automatically approve a user without requiring a pairing code
+    pub fn auto_approve(
+        &mut self,
+        channel: &str,
+        user_id: &str,
+        _username: Option<String>,
+        _display_name: Option<String>,
+    ) -> Result<()> {
+        self.approved
+            .entry(channel.to_string())
+            .or_default()
+            .push(user_id.to_string());
+        self.save()
+    }
+
     /// List all pending requests
     #[allow(dead_code)]
     pub fn list_pending(&mut self) -> Vec<&PendingRequest> {

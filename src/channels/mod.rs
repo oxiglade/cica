@@ -130,9 +130,17 @@ pub fn determine_action(
 
     // Check if user is approved
     if !store.is_approved(channel, user_id) {
-        let (code, _is_new) =
-            store.get_or_create_pending(channel, user_id, username, display_name)?;
-        return Ok(MessageAction::NeedsPairing { code });
+        let settings = crate::config::Config::load()
+            .map(|c: crate::config::Config| c.channel_settings(channel))
+            .unwrap_or_default();
+
+        if settings.auto_approve {
+            store.auto_approve(channel, user_id, username, display_name)?;
+        } else {
+            let (code, _is_new) =
+                store.get_or_create_pending(channel, user_id, username, display_name)?;
+            return Ok(MessageAction::NeedsPairing { code });
+        }
     }
 
     // Check if onboarding is complete

@@ -65,12 +65,16 @@ pub fn is_user_configured_for_user(channel: &str, user_id: &str) -> Result<bool>
 
 /// Get current onboarding phase for a specific user
 pub fn current_phase_for_user(channel: &str, user_id: &str) -> Result<Phase> {
-    // First check if this user's identity is set up
-    if !identity_path_for_user(channel, user_id)?.exists() {
+    let settings = crate::config::Config::load()
+        .map(|c: crate::config::Config| c.channel_settings(channel))
+        .unwrap_or_default();
+
+    // If shared_identity is enabled, skip identity phase (use PERSONA.md)
+    if !settings.shared_identity && !identity_path_for_user(channel, user_id)?.exists() {
         return Ok(Phase::Identity);
     }
 
-    // Then check if this user's profile is complete
+    // Check if this user's profile is complete
     if !user_path_for_user(channel, user_id)?.exists() {
         return Ok(Phase::User);
     }

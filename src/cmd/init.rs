@@ -219,7 +219,7 @@ async fn setup_telegram(existing_config: Option<Config>) -> Result<Config> {
 
     // Build config
     let mut config = existing_config.unwrap_or_default();
-    config.channels.telegram = Some(TelegramConfig { bot_token: token });
+    config.channels.telegram = Some(TelegramConfig::new(token));
     config.save()?;
 
     info!("Telegram setup complete");
@@ -440,9 +440,7 @@ async fn setup_signal(existing_config: Option<Config>) -> Result<Config> {
 
     // Build config
     let mut config = existing_config.unwrap_or_default();
-    config.channels.signal = Some(SignalConfig {
-        phone_number: phone_number.clone(),
-    });
+    config.channels.signal = Some(SignalConfig::new(phone_number.clone()));
     config.save()?;
 
     println!();
@@ -541,9 +539,7 @@ async fn setup_signal_with_number(
     }
 
     let mut config = existing_config.unwrap_or_default();
-    config.channels.signal = Some(SignalConfig {
-        phone_number: phone_number.to_string(),
-    });
+    config.channels.signal = Some(SignalConfig::new(phone_number.to_string()));
     config.save()?;
 
     println!();
@@ -711,9 +707,7 @@ async fn link_signal_device(existing_config: Option<Config>) -> Result<Config> {
     };
 
     let mut config = existing_config.unwrap_or_default();
-    config.channels.signal = Some(SignalConfig {
-        phone_number: phone_number.clone(),
-    });
+    config.channels.signal = Some(SignalConfig::new(phone_number.clone()));
     config.save()?;
 
     println!();
@@ -787,10 +781,7 @@ async fn setup_slack(existing_config: Option<Config>) -> Result<Config> {
 
     // Build config
     let mut config = existing_config.unwrap_or_default();
-    config.channels.slack = Some(SlackConfig {
-        bot_token,
-        app_token,
-    });
+    config.channels.slack = Some(SlackConfig::new(bot_token, app_token));
     config.save()?;
 
     info!("Slack setup complete");

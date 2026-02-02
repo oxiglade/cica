@@ -141,25 +141,108 @@ pub struct ChannelsConfig {
 }
 
 /// Telegram-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TelegramConfig {
+    #[serde(default)]
     pub bot_token: String,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default)]
+    pub shared_identity: bool,
+}
+
+impl TelegramConfig {
+    pub fn new(bot_token: String) -> Self {
+        Self {
+            bot_token,
+            ..Default::default()
+        }
+    }
 }
 
 /// Signal-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SignalConfig {
-    /// Phone number with country code (e.g., "+1234567890")
+    #[serde(default)]
     pub phone_number: String,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default)]
+    pub shared_identity: bool,
+}
+
+impl SignalConfig {
+    pub fn new(phone_number: String) -> Self {
+        Self {
+            phone_number,
+            ..Default::default()
+        }
+    }
 }
 
 /// Slack-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlackConfig {
-    /// Bot token (xoxb-...)
+    #[serde(default)]
     pub bot_token: String,
-    /// App-level token for Socket Mode (xapp-...)
+    #[serde(default)]
     pub app_token: String,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default)]
+    pub shared_identity: bool,
+}
+
+impl SlackConfig {
+    pub fn new(bot_token: String, app_token: String) -> Self {
+        Self {
+            bot_token,
+            app_token,
+            ..Default::default()
+        }
+    }
+}
+
+/// Channel settings relevant to pairing/onboarding
+#[derive(Debug, Clone, Default)]
+pub struct ChannelSettings {
+    pub auto_approve: bool,
+    pub shared_identity: bool,
+}
+
+impl Config {
+    pub fn channel_settings(&self, channel: &str) -> ChannelSettings {
+        match channel {
+            "telegram" => self
+                .channels
+                .telegram
+                .as_ref()
+                .map(|c| ChannelSettings {
+                    auto_approve: c.auto_approve,
+                    shared_identity: c.shared_identity,
+                })
+                .unwrap_or_default(),
+            "signal" => self
+                .channels
+                .signal
+                .as_ref()
+                .map(|c| ChannelSettings {
+                    auto_approve: c.auto_approve,
+                    shared_identity: c.shared_identity,
+                })
+                .unwrap_or_default(),
+            "slack" => self
+                .channels
+                .slack
+                .as_ref()
+                .map(|c| ChannelSettings {
+                    auto_approve: c.auto_approve,
+                    shared_identity: c.shared_identity,
+                })
+                .unwrap_or_default(),
+            _ => ChannelSettings::default(),
+        }
+    }
 }
 
 /// Claude configuration
