@@ -410,6 +410,21 @@ async fn handle_push_events(
                 }
             });
         }
+        SlackEventCallbackBody::AssistantThreadStarted(thread_event) => {
+            // User opened the assistant - send suggested prompts immediately
+            let states = user_state_storage.read().await;
+            let user_state = states
+                .get_user_state::<SlackUserState>()
+                .ok_or("Missing user state")?;
+
+            let token = user_state.bot_token.clone();
+            let channel_id = thread_event.assistant_thread.channel_id.clone();
+            let thread_ts = thread_event.assistant_thread.thread_ts.clone();
+
+            tokio::spawn(async move {
+                set_suggested_prompts(&client, &token, &channel_id, &thread_ts).await;
+            });
+        }
         _ => {
             debug!("Ignoring event type: {:?}", event);
         }
@@ -514,9 +529,6 @@ async fn handle_message_event(
             } else {
                 info!("User {} started thread {}", user_id, ts_str);
             }
-
-            // Set suggested prompts for new threads
-            set_suggested_prompts(&client, &token, &channel_id, ts).await;
         }
     }
 
