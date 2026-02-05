@@ -840,71 +840,179 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
         }
     }
 
-    // Get authentication
+    // Choose provider: Anthropic vs Google Vertex AI
     println!();
-    println!("Cica uses Claude Code, which can be billed through your Claude");
-    println!("subscription or based on API usage through your Console account.");
+    println!("Claude Code can use Anthropic directly or Google Vertex AI (GCP).");
     println!();
 
-    let auth_choices = vec![
-        "Claude subscription   Pro, Max, Team, or Enterprise",
-        "Anthropic Console     API usage billing",
+    let provider_choices = vec![
+        "Anthropic   Subscription (Pro/Max/Team) or API key",
+        "Google Vertex AI   GCP project (billing via Google Cloud)",
     ];
 
-    let auth_selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select login method")
-        .items(&auth_choices)
+    let provider_selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select Claude Code provider")
+        .items(&provider_choices)
         .default(0)
         .interact()?;
 
-    let credential = match auth_selection {
-        0 => {
-            // OAuth / setup-token flow
-            println!();
-            println!("Run this command in any terminal:");
-            println!();
-            println!("  claude setup-token");
-            println!();
-            println!("Note: The token may display across two lines, but it's one");
-            println!("continuous string. Copy and paste it as a single line.");
-            println!();
-
-            Password::with_theme(&ColorfulTheme::default())
-                .with_prompt("Paste the setup token")
-                .interact()?
-        }
-        1 => {
-            // API Key flow
-            println!();
-            println!("1. Go to https://console.anthropic.com/settings/keys");
-            println!("2. Create a new API key");
-            println!();
-
-            Password::with_theme(&ColorfulTheme::default())
-                .with_prompt("Paste your API key")
-                .interact()?
-        }
-        _ => unreachable!(),
-    };
-
-    // Trim whitespace and normalize
-    let credential = credential.trim().to_string();
-
-    print!("Validating... ");
-    std::io::Write::flush(&mut std::io::stdout())?;
-
-    match setup::validate_credential(&credential).await {
-        Ok(()) => println!("OK"),
-        Err(e) => {
-            println!("FAILED");
-            bail!("Authentication failed: {}", e);
-        }
-    }
-
-    // Save config
     let mut config = existing_config.unwrap_or_default();
     let was_using_cursor = config.backend == AiBackend::Cursor && config.is_cursor_configured();
-    config.claude.api_key = Some(credential);
+
+    if provider_selection == 1 {
+        // Vertex AI setup
+        let paths = config::paths()?;
+        println!();
+        println!("Vertex AI Setup");
+        println!("───────────────");
+        println!();
+        println!("You need a GCP project with Vertex AI enabled and Claude models");
+        println!("enabled in Model Garden.");
+        println!();
+
+        let project_id: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("GCP project ID")
+            .interact_text()?;
+
+        let region: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt(
+                "Region (e.g. europe-west1 or us-east5; see code.claude.com/docs/google-vertex-ai)",
+            )
+            .default("europe-west1".to_string())
+            .interact_text()?;
+
+        let auth_choices = vec![
+            "Service account key file (JSON)   Long-lived; recommended for servers",
+            "gcloud application-default login  Uses your user credentials (may expire)",
+        ];
+        let auth_selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("GCP auth (for servers use a service account key so auth does not expire)")
+            .items(&auth_choices)
+            .default(0)
+            .interact()?;
+
+        let vertex_credentials_path: Option<String> = if auth_selection == 0 {
+            println!();
+            println!("Create a service account in GCP with Vertex AI User (or similar),");
+            println!("download its JSON key, and enter the path below.");
+            println!("Path can be absolute or relative to your Cica config directory.");
+            println!();
+            let path: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Path to service account JSON key file")
+                .interact_text()?;
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                print!("Validating key file... ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                match setup::validate_vertex_credentials_path(&path, &paths.base) {
+                    Ok(()) => {
+                        println!("OK");
+                        Some(path)
+                    }
+                    Err(e) => {
+                        println!("FAILED");
+                        bail!("Invalid credentials file: {}", e);
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        print!("Validating Vertex config... ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        match setup::validate_vertex_config(
+            project_id.trim(),
+            Some(region.trim()),
+            vertex_credentials_path.as_deref(),
+            &paths.base,
+        )
+        .await
+        {
+            Ok(()) => println!("OK"),
+            Err(e) => {
+                println!("FAILED");
+                bail!("Vertex AI setup failed: {}", e);
+            }
+        }
+
+        config.claude.api_key = None;
+        config.claude.use_vertex = true;
+        config.claude.vertex_project_id = Some(project_id.trim().to_string());
+        config.claude.vertex_region = if region.trim().is_empty() {
+            None
+        } else {
+            Some(region.trim().to_string())
+        };
+        config.claude.vertex_credentials_path = vertex_credentials_path;
+    } else {
+        // Anthropic setup
+        println!();
+        println!("Cica uses Claude Code, which can be billed through your Claude");
+        println!("subscription or based on API usage through your Console account.");
+        println!();
+
+        let auth_choices = vec![
+            "Claude subscription   Pro, Max, Team, or Enterprise",
+            "Anthropic Console     API usage billing",
+        ];
+
+        let auth_selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select login method")
+            .items(&auth_choices)
+            .default(0)
+            .interact()?;
+
+        let credential = match auth_selection {
+            0 => {
+                println!();
+                println!("Run this command in any terminal:");
+                println!();
+                println!("  claude setup-token");
+                println!();
+                println!("Note: The token may display across two lines, but it's one");
+                println!("continuous string. Copy and paste it as a single line.");
+                println!();
+
+                Password::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Paste the setup token")
+                    .interact()?
+            }
+            1 => {
+                println!();
+                println!("1. Go to https://console.anthropic.com/settings/keys");
+                println!("2. Create a new API key");
+                println!();
+
+                Password::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Paste your API key")
+                    .interact()?
+            }
+            _ => unreachable!(),
+        };
+
+        let credential = credential.trim().to_string();
+
+        print!("Validating... ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        match setup::validate_credential(&credential).await {
+            Ok(()) => println!("OK"),
+            Err(e) => {
+                println!("FAILED");
+                bail!("Authentication failed: {}", e);
+            }
+        }
+
+        config.claude.api_key = Some(credential);
+        config.claude.use_vertex = false;
+        config.claude.vertex_project_id = None;
+        config.claude.vertex_region = None;
+        config.claude.vertex_credentials_path = None;
+    }
 
     // Ask whether to switch if another backend was active
     if was_using_cursor {

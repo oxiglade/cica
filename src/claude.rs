@@ -44,11 +44,21 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
     let config = Config::load()?;
     let paths = config::paths()?;
 
-    // Get credential
-    let credential = config
-        .claude
-        .api_key
-        .ok_or_else(|| anyhow!("No credential configured. Run `cica init` to set up Claude."))?;
+    // Resolve credential or Vertex config
+    let use_vertex = config.claude.use_vertex;
+    let vertex_project_id = config.claude.vertex_project_id.as_deref();
+    let credential = config.claude.api_key.as_deref();
+
+    if use_vertex {
+        let project_id = vertex_project_id
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Vertex AI is enabled but no project ID is set. Run `cica init` to configure Vertex AI."))?;
+        debug!("Using Vertex AI project: {}", project_id);
+    } else {
+        credential.ok_or_else(|| {
+            anyhow!("No credential configured. Run `cica init` to set up Claude.")
+        })?;
+    }
 
     // Get Bun path
     let bun = setup::find_bun()
@@ -100,14 +110,43 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
     // Add the prompt
     cmd.arg(prompt);
 
-    // Set auth env var based on credential type
-    match setup::detect_credential_type(&credential) {
-        setup::CredentialType::ApiKey => {
-            cmd.env("ANTHROPIC_API_KEY", &credential);
+    // Set auth env vars: either Vertex AI (GCP) or Anthropic API key / OAuth
+    if use_vertex {
+        cmd.env("CLAUDE_CODE_USE_VERTEX", "1");
+        cmd.env(
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            vertex_project_id.unwrap_or(""),
+        );
+        cmd.env(
+            "CLOUD_ML_REGION",
+            config
+                .claude
+                .vertex_region
+                .as_deref()
+                .unwrap_or("europe-west1"),
+        );
+        // Long-lived auth: service account key file (recommended for servers; no gcloud expiry)
+        if let Some(ref cred_path) = config.claude.vertex_credentials_path {
+            let path = std::path::Path::new(cred_path);
+            let abs = if path.is_relative() {
+                paths.base.join(cred_path)
+            } else {
+                path.to_path_buf()
+            };
+            if abs.exists() {
+                cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
+            }
         }
-        setup::CredentialType::OAuthToken => {
-            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", &credential);
-            cmd.env("ANTHROPIC_OAUTH_TOKEN", &credential);
+        // Otherwise Vertex uses gcloud ADC or existing GOOGLE_APPLICATION_CREDENTIALS env
+    } else if let Some(cred) = credential {
+        match setup::detect_credential_type(cred) {
+            setup::CredentialType::ApiKey => {
+                cmd.env("ANTHROPIC_API_KEY", cred);
+            }
+            setup::CredentialType::OAuthToken => {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", cred);
+                cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
+            }
         }
     }
 

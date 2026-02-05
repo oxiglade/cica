@@ -260,8 +260,18 @@ impl Config {
 /// Claude configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClaudeConfig {
-    /// Anthropic API key or OAuth token
+    /// Anthropic API key or OAuth token (used when not using Vertex AI)
     pub api_key: Option<String>,
+    /// Use Google Vertex AI instead of Anthropic API
+    #[serde(default)]
+    pub use_vertex: bool,
+    /// GCP project ID for Vertex AI (required when use_vertex is true)
+    pub vertex_project_id: Option<String>,
+    /// GCP region for Vertex AI (e.g. "europe-west1", "us-east5"). Defaults to "europe-west1" if unset.
+    pub vertex_region: Option<String>,
+    /// Path to GCP service account JSON key file (long-lived auth; recommended for servers).
+    /// When set, GOOGLE_APPLICATION_CREDENTIALS is set for Claude so gcloud login is not needed.
+    pub vertex_credentials_path: Option<String>,
 }
 
 /// Cursor CLI configuration
@@ -324,9 +334,16 @@ impl Config {
         channels
     }
 
-    /// Check if Claude is configured
+    /// Check if Claude is configured (Anthropic API key or Vertex AI)
     pub fn is_claude_configured(&self) -> bool {
-        self.claude.api_key.is_some()
+        if self.claude.use_vertex {
+            self.claude
+                .vertex_project_id
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+        } else {
+            self.claude.api_key.is_some()
+        }
     }
 
     /// Check if Cursor is configured

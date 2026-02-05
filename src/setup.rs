@@ -474,6 +474,77 @@ fn cursor_cli_download_url() -> Result<String> {
     ))
 }
 
+/// Validate a GCP service account JSON key file (exists and has required fields).
+/// Use this for long-lived auth on servers; the key does not expire like gcloud login.
+pub fn validate_vertex_credentials_path(path: &str, base_dir: &Path) -> Result<()> {
+    let p = Path::new(path.trim());
+    let full = if p.is_relative() {
+        base_dir.join(p)
+    } else {
+        p.to_path_buf()
+    };
+    if !full.exists() {
+        bail!("Credentials file not found: {}", full.display());
+    }
+    let content = std::fs::read_to_string(&full)
+        .with_context(|| format!("Could not read credentials file: {}", full.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Invalid JSON in credentials file: {}", full.display()))?;
+    let obj = json
+        .as_object()
+        .ok_or_else(|| anyhow!("Credentials file must be a JSON object"))?;
+    if !obj.contains_key("client_email") || !obj.contains_key("private_key") {
+        bail!(
+            "Credentials file must contain \"client_email\" and \"private_key\" (GCP service account key)"
+        );
+    }
+    Ok(())
+}
+
+/// Validate Vertex AI configuration (project ID set and GCP auth available).
+/// If credentials_path is Some, validates that file and does not require gcloud.
+pub async fn validate_vertex_config(
+    project_id: &str,
+    _region: Option<&str>,
+    credentials_path: Option<&str>,
+    base_dir: &Path,
+) -> Result<()> {
+    let trimmed = project_id.trim();
+    if trimmed.is_empty() {
+        bail!("Vertex AI project ID cannot be empty");
+    }
+    if let Some(path) = credentials_path {
+        let p = path.trim();
+        if !p.is_empty() {
+            validate_vertex_credentials_path(p, base_dir)?;
+            return Ok(());
+        }
+    }
+    // No key file: check gcloud ADC or GOOGLE_APPLICATION_CREDENTIALS
+    let check = tokio::process::Command::new("gcloud")
+        .args(["auth", "application-default", "print-access-token"])
+        .output()
+        .await;
+    match check {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(_) => bail!(
+            "GCP credentials not found. Run: gcloud auth application-default login \
+             or set a service account key path in cica init (recommended for servers)"
+        ),
+        Err(_) => {
+            if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok() {
+                Ok(())
+            } else {
+                bail!(
+                    "Neither gcloud nor GOOGLE_APPLICATION_CREDENTIALS found. \
+                     For Vertex AI, run: gcloud auth application-default login \
+                     or set a service account key path in cica init (recommended for servers)"
+                )
+            }
+        }
+    }
+}
+
 /// Validate a Cursor API key by making a test request
 pub async fn validate_cursor_api_key(api_key: &str) -> Result<()> {
     // Cursor uses their own API - we can try to list models to validate
