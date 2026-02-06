@@ -415,7 +415,8 @@ pub fn build_context_prompt_for_user(
             lines.push(String::new());
             lines.push("The file uses this format:".to_string());
             lines.push("```json".to_string());
-            lines.push(r#"{
+            lines.push(
+                r#"{
   "mcpServers": {
     "server-name": {
       "command": "npx",
@@ -423,7 +424,9 @@ pub fn build_context_prompt_for_user(
       "env": {}
     }
   }
-}"#.to_string());
+}"#
+                .to_string(),
+            );
             lines.push("```".to_string());
         }
         config::AiBackend::Cursor => {
@@ -435,7 +438,8 @@ pub fn build_context_prompt_for_user(
             lines.push(String::new());
             lines.push("The file uses this format:".to_string());
             lines.push("```json".to_string());
-            lines.push(r#"{
+            lines.push(
+                r#"{
   "mcpServers": {
     "server-name": {
       "command": "npx",
@@ -443,7 +447,9 @@ pub fn build_context_prompt_for_user(
       "env": {}
     }
   }
-}"#.to_string());
+}"#
+                .to_string(),
+            );
             lines.push("```".to_string());
         }
     }
