@@ -19,6 +19,7 @@ use tracing::warn;
 
 use crate::config;
 use crate::memory::{MemoryIndex, memories_dir};
+use crate::setup;
 use crate::skills;
 
 /// Onboarding phase
@@ -431,6 +432,9 @@ pub fn build_context_prompt_for_user(
         }
         config::AiBackend::Cursor => {
             let mcp_config_path = paths.cursor_home.join(".cursor").join("mcp.json");
+            let cursor_cli = setup::find_cursor_cli()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "cursor-agent".to_string());
             lines.push(format!(
                 "To add an MCP server, edit: {}",
                 mcp_config_path.display()
@@ -451,6 +455,12 @@ pub fn build_context_prompt_for_user(
                 .to_string(),
             );
             lines.push("```".to_string());
+            lines.push(String::new());
+            lines.push(format!(
+                "After adding the config, enable the server by running: HOME={} {} mcp enable <server-name>",
+                paths.cursor_home.display(),
+                cursor_cli,
+            ));
         }
     }
     lines.push(String::new());

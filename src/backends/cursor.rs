@@ -136,6 +136,7 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
 
     let mut cmd = Command::new(&cursor_cli);
     cmd.args(["-p", "--output-format", "stream-json"])
+        .arg("--approve-mcps")
         .args(["--api-key", &api_key])
         .env("HOME", &paths.cursor_home);
 
