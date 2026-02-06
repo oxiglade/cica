@@ -9,14 +9,12 @@ use tracing::{debug, info, warn};
 use crate::config::{self, Config};
 use crate::setup;
 
-/// Available models for Claude Code, newest first.
 pub const MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-6", "Claude Opus 4.6"),
     ("claude-opus-4-5", "Claude Opus 4.5"),
     ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
 ];
 
-/// Response from Claude CLI in JSON format
 #[derive(Debug, Deserialize)]
 struct ClaudeResponse {
     #[serde(rename = "type")]
@@ -26,34 +24,26 @@ struct ClaudeResponse {
     duration_ms: Option<u64>,
 }
 
-/// Options for querying Claude
 #[derive(Default)]
 pub struct QueryOptions {
-    /// System prompt to use
     pub system_prompt: Option<String>,
-    /// Resume an existing session by ID (uses --resume)
     pub resume_session: Option<String>,
-    /// Working directory for Claude
     pub cwd: Option<String>,
-    /// Skip permission prompts (for automated flows)
     pub skip_permissions: bool,
     /// Model alias ("sonnet", "opus") or full model ID (e.g. "claude-sonnet-4-5-20250929")
     pub model: Option<String>,
 }
 
-/// Query Claude with a prompt and return the response
 #[allow(dead_code)]
 pub async fn query(prompt: &str) -> Result<String> {
     let (result, _) = query_with_options(prompt, QueryOptions::default()).await?;
     Ok(result)
 }
 
-/// Query Claude with options and return (response, session_id)
 pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(String, String)> {
     let config = Config::load()?;
     let paths = config::paths()?;
 
-    // Resolve credential or Vertex config
     let use_vertex = config.claude.use_vertex;
     let vertex_project_id = config.claude.vertex_project_id.as_deref();
     let credential = config.claude.api_key.as_deref();
@@ -69,11 +59,9 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
         })?;
     }
 
-    // Get Bun path
     let bun = setup::find_bun()
         .ok_or_else(|| anyhow!("Bun not found. Run `cica init` to set up Claude."))?;
 
-    // Get Claude Code entry point
     let claude_code = setup::find_claude_code()
         .ok_or_else(|| anyhow!("Claude Code not found. Run `cica init` to set up Claude."))?;
 
@@ -81,19 +69,16 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
     debug!("Using bun: {:?}", bun);
     debug!("Using claude_code: {:?}", claude_code);
 
-    // Build command
     let mut cmd = Command::new(&bun);
     cmd.arg("run")
         .arg(&claude_code)
         .args(["-p", "--output-format", "json"])
         .env("HOME", &paths.claude_home);
 
-    // Skip permissions if requested
     if options.skip_permissions {
         cmd.arg("--dangerously-skip-permissions");
     }
 
-    // Add system prompt
     if let Some(ref system_prompt) = options.system_prompt {
         if options.resume_session.is_none() {
             // New session: full system prompt
@@ -104,24 +89,20 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
         }
     }
 
-    // Resume existing session if provided
     if let Some(ref session_id) = options.resume_session {
         cmd.args(["--resume", session_id]);
     }
 
-    // Model selection
     if let Some(ref model) = options.model {
         cmd.args(["--model", model]);
     }
 
-    // Set working directory
     if let Some(ref cwd) = options.cwd {
         cmd.current_dir(cwd);
     } else {
         cmd.current_dir(&paths.base);
     }
 
-    // Add the prompt
     cmd.arg(prompt);
 
     // Set auth env vars: either Vertex AI (GCP) or Anthropic API key / OAuth
@@ -187,7 +168,6 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
 
     debug!("Claude raw output: {}", stdout);
 
-    // Parse the JSON response - find the result line
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;

@@ -22,7 +22,7 @@ use chrono::{DateTime, Local};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::backend::{self, QueryOptions};
+use crate::backends::{self, QueryOptions};
 use crate::channels::get_channel_info;
 use crate::onboarding;
 
@@ -264,7 +264,7 @@ async fn execute_job<C: Clock>(
     // Execute the AI backend prompt
     let result = match context_prompt {
         Ok(ctx) => {
-            backend::query_with_options(
+            backends::query_with_options(
                 &job.prompt,
                 QueryOptions {
                     system_prompt: Some(ctx),

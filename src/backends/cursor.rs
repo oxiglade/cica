@@ -10,14 +10,11 @@ use tracing::{debug, info, warn};
 use crate::config::{self, Config};
 use crate::setup;
 
-/// Password for the sandboxed keychain (not secret - just for isolation)
 #[cfg(target_os = "macos")]
 const KEYCHAIN_PASSWORD: &str = "cica";
 
-/// Default model to use if none specified
 const DEFAULT_MODEL: &str = "opus-4.5";
 
-/// Fallback models when `--list-models` is unavailable
 pub const FALLBACK_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
     ("claude-opus-4-5", "Claude Opus 4.5"),
@@ -25,7 +22,6 @@ pub const FALLBACK_MODELS: &[(&str, &str)] = &[
     ("auto", "Auto (let Cursor choose)"),
 ];
 
-/// Fetch available models via `cursor-agent --list-models`.
 /// Falls back to `FALLBACK_MODELS` if the CLI is unavailable or the command fails.
 pub async fn list_models(api_key: &str) -> Vec<(String, String)> {
     let cli = match setup::find_cursor_cli() {
@@ -92,58 +88,42 @@ fn fallback_models() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Response event from Cursor CLI in stream-json format
 #[derive(Debug, Deserialize)]
 struct CursorEvent {
     #[serde(rename = "type")]
     event_type: String,
-    /// For "result" events
     result: Option<String>,
-    /// Session ID (present in most events)
     session_id: Option<String>,
-    /// For "result" events
     duration_ms: Option<u64>,
-    /// For error detection
     is_error: Option<bool>,
 }
 
-/// Options for querying Cursor
 #[derive(Default)]
 pub struct QueryOptions {
-    /// Context to prepend to the message
     pub context: Option<String>,
-    /// Resume an existing session by ID
     pub resume_session: Option<String>,
-    /// Working directory for Cursor
     pub cwd: Option<String>,
-    /// Model to use
     pub model: Option<String>,
-    /// Skip confirmation prompts
     pub force: bool,
 }
 
-/// Query Cursor with a prompt and return the response
 #[allow(dead_code)]
 pub async fn query(prompt: &str) -> Result<String> {
     let (result, _) = query_with_options(prompt, QueryOptions::default()).await?;
     Ok(result)
 }
 
-/// Query Cursor with options and return (response, session_id)
 pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(String, String)> {
     let config = Config::load()?;
     let paths = config::paths()?;
 
-    // Get API key
     let api_key = config.cursor.api_key.ok_or_else(|| {
         anyhow!("No Cursor API key configured. Run `cica init` to set up Cursor.")
     })?;
 
-    // Get Cursor CLI path
     let cursor_cli = setup::find_cursor_cli()
         .ok_or_else(|| anyhow!("Cursor CLI not found. Run `cica init` to set up Cursor."))?;
 
-    // Build the actual prompt - prepend context if provided
     let full_prompt = match &options.context {
         Some(context) => format!("<context>\n{}\n</context>\n\n{}", context, prompt),
         None => prompt.to_string(),
@@ -152,7 +132,6 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
     info!("Querying Cursor: {}", prompt);
     debug!("Using cursor_cli: {:?}", cursor_cli);
 
-    // Ensure sandboxed keychain exists and is unlocked (macOS)
     ensure_keychain(&paths.cursor_home).await?;
 
     let mut cmd = Command::new(&cursor_cli);
@@ -160,31 +139,26 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
         .args(["--api-key", &api_key])
         .env("HOME", &paths.cursor_home);
 
-    // Force mode for automated flows
     if options.force {
         cmd.arg("--force");
     }
 
-    // Model selection
     let model = options
         .model
         .or(config.cursor.model)
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     cmd.args(["--model", &model]);
 
-    // Resume existing session if provided
     if let Some(ref session_id) = options.resume_session {
         cmd.args(["--resume", session_id]);
     }
 
-    // Set working directory
     if let Some(ref cwd) = options.cwd {
         cmd.current_dir(cwd);
     } else {
         cmd.current_dir(&paths.base);
     }
 
-    // Add the prompt
     cmd.arg(&full_prompt);
 
     let output = cmd
@@ -210,7 +184,6 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
 
     debug!("Cursor raw output: {}", stdout);
 
-    // Parse the stream-json response
     let mut final_result = None;
     let mut final_session_id = None;
 
@@ -223,12 +196,10 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
             continue;
         };
 
-        // Track session_id from any event
         if event.session_id.is_some() {
             final_session_id = event.session_id.clone();
         }
 
-        // Look for result event
         if event.event_type == "result" {
             if event.is_error == Some(true) {
                 bail!("Cursor returned an error");
@@ -249,7 +220,6 @@ pub async fn query_with_options(prompt: &str, options: QueryOptions) -> Result<(
     }
 }
 
-/// Ensure the sandboxed keychain exists and is unlocked (macOS only)
 #[cfg(target_os = "macos")]
 async fn ensure_keychain(cursor_home: &Path) -> Result<()> {
     let keychain_dir = cursor_home.join("Library/Keychains");
@@ -302,7 +272,6 @@ async fn ensure_keychain(cursor_home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// No-op on non-macOS platforms
 #[cfg(not(target_os = "macos"))]
 async fn ensure_keychain(_cursor_home: &Path) -> Result<()> {
     Ok(())

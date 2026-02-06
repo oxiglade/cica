@@ -2,10 +2,9 @@ use anyhow::{Result, bail};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use tracing::info;
 
+use crate::backends::{claude, cursor};
 use crate::channels::{self, signal, slack, telegram};
-use crate::claude;
 use crate::config::{self, AiBackend, Config, SignalConfig, SlackConfig, TelegramConfig};
-use crate::cursor;
 use crate::setup;
 
 /// Run the init command

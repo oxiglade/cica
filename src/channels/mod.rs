@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::backend::{self, QueryOptions};
+use crate::backends::{self, QueryOptions};
 use crate::cron::{
     self, CronSchedule, CronStore, format_timestamp, parse_add_command, truncate_for_name,
 };
@@ -802,7 +802,7 @@ pub async fn execute_cron_job(job_id: &str, channel: &str, user_id: &str) -> Res
         Some(&job.prompt),
     )?;
 
-    let (response, _session_id) = backend::query_with_options(
+    let (response, _session_id) = backends::query_with_options(
         &job.prompt,
         QueryOptions {
             system_prompt: Some(context_prompt),
@@ -865,14 +865,14 @@ pub async fn query_ai_with_session(
     let session_key = format!("{}:{}", channel, user_id);
     let existing_session = store.sessions.get(&session_key).cloned();
 
-    let options = backend::QueryOptions {
+    let options = backends::QueryOptions {
         system_prompt: Some(context_prompt.clone()),
         resume_session: existing_session,
         skip_permissions: true,
         ..Default::default()
     };
 
-    let (response, session_id) = match backend::query_with_options(text, options).await {
+    let (response, session_id) = match backends::query_with_options(text, options).await {
         Ok((response, session_id)) => (response, session_id),
         Err(e) => {
             let error_msg = e.to_string();
@@ -884,14 +884,14 @@ pub async fn query_ai_with_session(
                 store.sessions.remove(&session_key);
                 store.save()?;
 
-                let retry_options = backend::QueryOptions {
+                let retry_options = backends::QueryOptions {
                     system_prompt: Some(context_prompt),
                     resume_session: None,
                     skip_permissions: true,
                     ..Default::default()
                 };
 
-                match backend::query_with_options(text, retry_options).await {
+                match backends::query_with_options(text, retry_options).await {
                     Ok((response, session_id)) => (response, session_id),
                     Err(e) => {
                         warn!("AI backend error on retry: {}", e);
@@ -926,13 +926,13 @@ pub async fn query_ai_with_session(
 pub async fn handle_onboarding(channel: &str, user_id: &str, message: &str) -> Result<String> {
     let system_prompt = onboarding::system_prompt_for_user(channel, user_id)?;
 
-    let options = backend::QueryOptions {
+    let options = backends::QueryOptions {
         system_prompt: Some(system_prompt),
         skip_permissions: true,
         ..Default::default()
     };
 
-    let (response, _) = backend::query_with_options(message, options).await?;
+    let (response, _) = backends::query_with_options(message, options).await?;
     Ok(response)
 }
 
