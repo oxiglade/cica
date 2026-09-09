@@ -151,8 +151,10 @@ resumes the same conversation rather than starting cold.
 ### `[claude]`
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `api_key` | string | — | Anthropic API key or OAuth token (when not using Vertex). |
+| `api_key` | string | — | Anthropic API key or OAuth token (unused when `use_bedrock` or `use_vertex` is set). |
 | `model` | string | — | Alias (`"sonnet"`, `"opus"`) or full model ID. |
+| `use_bedrock` | bool | `false` | Use Amazon Bedrock instead of the Anthropic API. Credentials come from the AWS provider chain, so `api_key` is unused; takes precedence over `use_vertex`. |
+| `bedrock_region` | string | — | AWS region for Bedrock (e.g. `"eu-central-1"`). When unset, Claude Code resolves the region from the ambient AWS environment. |
 | `use_vertex` | bool | `false` | Use Google Vertex AI instead of the Anthropic API. |
 | `vertex_project_id` | string | — | GCP project ID (required when `use_vertex`). |
 | `vertex_region` | string | `"europe-west1"` | GCP region for Vertex. |
@@ -243,6 +245,8 @@ These overlay config at load time (env wins over file). The cloud worker uses th
 | `CICA_CURSOR_API_KEY` | `cursor.api_key` | |
 | `CICA_CLAUDE_MODEL` | `claude.model` | Alias (`"sonnet"`, `"opus"`) or full model ID; workers use it only as a fallback. |
 | `CICA_CURSOR_MODEL` | `cursor.model` | Workers use it only as a fallback. |
+| `CICA_CLAUDE_USE_BEDROCK` | `claude.use_bedrock` | `1`/`true`/`yes`/`on` (or the falsy equivalents). An unrecognised value is ignored with a warning. |
+| `CICA_CLAUDE_BEDROCK_REGION` | `claude.bedrock_region` | AWS region for Bedrock; omit to use the ambient AWS environment. |
 | `CICA_BACKEND` | `backend` | `claude` or `cursor`; workers do not use it for turns. |
 | `CICA_STORE` | `deployment.store` | `s3` or `filesystem`. |
 | `CICA_STATE_PATH` | `deployment.state_path` | Filesystem state-store root; Docker workers receive `/data/cica/internal/state-store`. |

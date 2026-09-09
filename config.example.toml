@@ -56,6 +56,14 @@ bot_token = "123456:ABC-your-telegram-bot-token"
 api_key = "sk-ant-..."
 # model = "sonnet"          # alias or full model ID
 
+# Amazon Bedrock instead of the Anthropic API. Credentials come from the AWS
+# provider chain (task role, instance profile, shared profile) -- api_key above
+# is not used and is not required. Omit bedrock_region to let the AWS
+# environment decide. Pin an inference profile with `model`, e.g.
+# "eu.anthropic.claude-opus-5".
+# use_bedrock = true
+# bedrock_region = "eu-central-1"
+
 # Vertex AI instead of the Anthropic API:
 # use_vertex = true
 # vertex_project_id = "my-gcp-project"

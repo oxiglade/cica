@@ -55,17 +55,83 @@ fn config_relative_path(paths: &Paths, value: &str) -> std::path::PathBuf {
     }
 }
 
+/// Point Claude Code at the configured provider and give it the credentials
+/// that provider needs.
+///
+/// Lifted out of the command builder so the choice is unit testable without
+/// spawning a process — in particular the removal of Anthropic credentials
+/// under Bedrock, which is what keeps a turn inside the chosen region.
+fn apply_backend_env(cmd: &mut Command, claude: &ClaudeConfig, paths: &Paths) {
+    if claude.use_bedrock {
+        cmd.env("CLAUDE_CODE_USE_BEDROCK", "1");
+        if let Some(region) = claude.bedrock_region.as_deref().filter(|s| !s.is_empty()) {
+            cmd.env("AWS_REGION", region);
+        }
+        // No Anthropic credential is passed, and any inherited one is removed.
+        // Claude Code already prefers Bedrock when both are present, but
+        // stripping them makes "requests never reach the Anthropic API" a
+        // property of this process rather than a behaviour of the CLI that a
+        // future version could change.
+        cmd.env_remove("ANTHROPIC_API_KEY");
+        cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+        cmd.env_remove("ANTHROPIC_OAUTH_TOKEN");
+        cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    } else if claude.use_vertex {
+        cmd.env("CLAUDE_CODE_USE_VERTEX", "1");
+        cmd.env(
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            claude.vertex_project_id.as_deref().unwrap_or(""),
+        );
+        cmd.env(
+            "CLOUD_ML_REGION",
+            claude.vertex_region.as_deref().unwrap_or("europe-west1"),
+        );
+        // Long-lived auth: service account key file (recommended for servers; no gcloud expiry)
+        if let Some(ref cred_path) = claude.vertex_credentials_path {
+            let abs = config_relative_path(paths, cred_path);
+            if abs.exists() {
+                cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
+            }
+        }
+        // Otherwise Vertex uses gcloud ADC or existing GOOGLE_APPLICATION_CREDENTIALS env
+    } else if let Some(cred) = claude.api_key.as_deref() {
+        match setup::detect_credential_type(cred) {
+            setup::CredentialType::ApiKey => {
+                cmd.env("ANTHROPIC_API_KEY", cred);
+            }
+            setup::CredentialType::OAuthToken => {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", cred);
+                cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
+            }
+        }
+    }
+}
+
 pub async fn query_with_options(
     claude: &ClaudeConfig,
     paths: &Paths,
     prompt: &str,
     options: QueryOptions,
 ) -> Result<QueryResult> {
+    let use_bedrock = claude.use_bedrock;
     let use_vertex = claude.use_vertex;
+    let bedrock_region = claude.bedrock_region.as_deref().filter(|s| !s.is_empty());
     let vertex_project_id = claude.vertex_project_id.as_deref();
     let credential = claude.api_key.as_deref();
 
-    if use_vertex {
+    if use_bedrock {
+        if use_vertex {
+            warn!("both use_bedrock and use_vertex are set; using Bedrock");
+        }
+        // Nothing to validate. AWS credentials come from the provider chain --
+        // an ECS task role, an EC2 instance profile, a shared profile -- none of
+        // which is visible from here, and the region may come from the ambient
+        // AWS environment when `bedrock_region` is unset.
+        match bedrock_region {
+            Some(region) => debug!("Using Amazon Bedrock in {}", region),
+            None => debug!("Using Amazon Bedrock (region from the AWS environment)"),
+        }
+    } else if use_vertex {
         let project_id = vertex_project_id
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("Vertex AI is enabled but no project ID is set. Run `cica init` to configure Vertex AI."))?;
@@ -128,35 +194,7 @@ pub async fn query_with_options(
 
         cmd.arg(prompt);
 
-        if use_vertex {
-            cmd.env("CLAUDE_CODE_USE_VERTEX", "1");
-            cmd.env(
-                "ANTHROPIC_VERTEX_PROJECT_ID",
-                vertex_project_id.unwrap_or(""),
-            );
-            cmd.env(
-                "CLOUD_ML_REGION",
-                claude.vertex_region.as_deref().unwrap_or("europe-west1"),
-            );
-            // Long-lived auth: service account key file (recommended for servers; no gcloud expiry)
-            if let Some(ref cred_path) = claude.vertex_credentials_path {
-                let abs = config_relative_path(paths, cred_path);
-                if abs.exists() {
-                    cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
-                }
-            }
-            // Otherwise Vertex uses gcloud ADC or existing GOOGLE_APPLICATION_CREDENTIALS env
-        } else if let Some(cred) = credential {
-            match setup::detect_credential_type(cred) {
-                setup::CredentialType::ApiKey => {
-                    cmd.env("ANTHROPIC_API_KEY", cred);
-                }
-                setup::CredentialType::OAuthToken => {
-                    cmd.env("CLAUDE_CODE_OAUTH_TOKEN", cred);
-                    cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
-                }
-            }
-        }
+        apply_backend_env(&mut cmd, claude, paths);
 
         cmd
     };
@@ -235,7 +273,132 @@ pub async fn query_with_options(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeResponse, config_relative_path, is_missing_conversation, served_models};
+    use std::collections::HashMap;
+
+    use tokio::process::Command;
+
+    use super::{
+        ClaudeResponse, apply_backend_env, config_relative_path, is_missing_conversation,
+        served_models,
+    };
+    use crate::config::{ClaudeConfig, Paths};
+
+    /// Environment the command would hand to Claude Code. A `None` value is a
+    /// removal: the child cannot inherit that variable from us.
+    fn envs(cmd: &Command) -> HashMap<String, Option<String>> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn applied(claude: &ClaudeConfig) -> HashMap<String, Option<String>> {
+        let mut cmd = Command::new("claude");
+        apply_backend_env(
+            &mut cmd,
+            claude,
+            &Paths::for_base(std::path::PathBuf::from("/worker")),
+        );
+        envs(&cmd)
+    }
+
+    const ANTHROPIC_CREDENTIAL_VARS: [&str; 4] = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
+
+    #[test]
+    fn bedrock_names_the_region_and_strips_every_anthropic_credential() {
+        // An api_key is present on purpose: a deployment mid-migration still
+        // carries one, and it must not reach the child.
+        let env = applied(&ClaudeConfig {
+            api_key: Some("sk-ant-api03-still-in-the-secret".into()),
+            use_bedrock: true,
+            bedrock_region: Some("eu-central-1".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(env.get("CLAUDE_CODE_USE_BEDROCK"), Some(&Some("1".into())));
+        assert_eq!(env.get("AWS_REGION"), Some(&Some("eu-central-1".into())));
+        for var in ANTHROPIC_CREDENTIAL_VARS {
+            assert_eq!(
+                env.get(var),
+                Some(&None),
+                "{var} must be removed, not passed through"
+            );
+        }
+        assert!(!env.contains_key("CLAUDE_CODE_USE_VERTEX"));
+    }
+
+    #[test]
+    fn bedrock_without_a_region_defers_to_the_aws_environment() {
+        let env = applied(&ClaudeConfig {
+            use_bedrock: true,
+            bedrock_region: None,
+            ..Default::default()
+        });
+        assert_eq!(env.get("CLAUDE_CODE_USE_BEDROCK"), Some(&Some("1".into())));
+        assert!(
+            !env.contains_key("AWS_REGION"),
+            "an unset region must leave AWS_REGION to the environment, not blank it"
+        );
+    }
+
+    #[test]
+    fn an_empty_region_is_treated_as_unset() {
+        let env = applied(&ClaudeConfig {
+            use_bedrock: true,
+            bedrock_region: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(!env.contains_key("AWS_REGION"));
+    }
+
+    #[test]
+    fn bedrock_takes_precedence_over_vertex() {
+        let env = applied(&ClaudeConfig {
+            use_bedrock: true,
+            use_vertex: true,
+            vertex_project_id: Some("some-project".into()),
+            ..Default::default()
+        });
+        assert_eq!(env.get("CLAUDE_CODE_USE_BEDROCK"), Some(&Some("1".into())));
+        assert!(!env.contains_key("CLAUDE_CODE_USE_VERTEX"));
+        assert!(!env.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+    }
+
+    #[test]
+    fn an_api_key_still_reaches_claude_code_when_bedrock_is_off() {
+        let env = applied(&ClaudeConfig {
+            api_key: Some("sk-ant-api03-real".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY"),
+            Some(&Some("sk-ant-api03-real".into()))
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_USE_BEDROCK"));
+    }
+
+    #[test]
+    fn an_oauth_token_still_reaches_claude_code_when_bedrock_is_off() {
+        let env = applied(&ClaudeConfig {
+            api_key: Some("sk-ant-oat01-token".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(&Some("sk-ant-oat01-token".into()))
+        );
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    }
 
     #[test]
     fn vertex_credentials_resolve_from_config_directory() {

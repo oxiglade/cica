@@ -622,6 +622,12 @@ pub struct ClaudeConfig {
     /// Path to GCP service account JSON key file (long-lived auth; recommended for servers).
     /// When set, GOOGLE_APPLICATION_CREDENTIALS is set for Claude so gcloud login is not needed.
     pub vertex_credentials_path: Option<String>,
+    /// Use Amazon Bedrock instead of the Anthropic API. Takes precedence over `use_vertex`.
+    #[serde(default)]
+    pub use_bedrock: bool,
+    /// AWS region for Bedrock (e.g. "eu-central-1"). When unset, Claude Code resolves
+    /// the region itself from the ambient AWS environment.
+    pub bedrock_region: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -635,6 +641,20 @@ pub struct CursorConfig {
 // ============================================================================
 // Config Operations
 // ============================================================================
+
+/// Truthy/falsy values accepted for boolean env overlays, case-insensitive.
+/// An unrecognised value is ignored with a warning so a typo leaves the config
+/// file's value in place instead of silently flipping it.
+fn env_bool(name: &str, value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        other => {
+            tracing::warn!("ignoring invalid {name}={other}: expected a boolean");
+            None
+        }
+    }
+}
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -683,6 +703,14 @@ impl Config {
         }
         if let Some(v) = get("CICA_CLAUDE_MODEL") {
             self.claude.model = Some(v);
+        }
+        if let Some(v) =
+            get("CICA_CLAUDE_USE_BEDROCK").and_then(|v| env_bool("CICA_CLAUDE_USE_BEDROCK", &v))
+        {
+            self.claude.use_bedrock = v;
+        }
+        if let Some(v) = get("CICA_CLAUDE_BEDROCK_REGION") {
+            self.claude.bedrock_region = Some(v);
         }
         if let Some(v) = get("CICA_BACKEND") {
             match v.as_str() {
@@ -800,7 +828,12 @@ impl Config {
     }
 
     pub fn is_claude_configured(&self) -> bool {
-        if self.claude.use_vertex {
+        if self.claude.use_bedrock {
+            // Nothing to check: AWS credentials come from the provider chain
+            // (task role, instance profile, shared profile) and the region can
+            // come from the ambient AWS environment, so neither is visible here.
+            true
+        } else if self.claude.use_vertex {
             self.claude
                 .vertex_project_id
                 .as_ref()
@@ -1076,6 +1109,49 @@ mod tests {
         cfg.overlay_from_env(env);
         assert_eq!(cfg.claude.model.as_deref(), Some("opus"));
         assert_eq!(cfg.cursor.model.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn env_overlay_enables_bedrock_with_region() {
+        let mut cfg = Config::default();
+        assert!(!cfg.claude.use_bedrock);
+        let env = |k: &str| match k {
+            "CICA_CLAUDE_USE_BEDROCK" => Some("1".to_string()),
+            "CICA_CLAUDE_BEDROCK_REGION" => Some("eu-central-1".to_string()),
+            _ => None,
+        };
+        cfg.overlay_from_env(env);
+        assert!(cfg.claude.use_bedrock);
+        assert_eq!(cfg.claude.bedrock_region.as_deref(), Some("eu-central-1"));
+    }
+
+    #[test]
+    fn env_overlay_ignores_unparseable_bedrock_flag() {
+        let mut cfg = Config::default();
+        cfg.claude.use_bedrock = true;
+        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "maybe".to_string()));
+        // A typo must not silently send turns back to the Anthropic API.
+        assert!(cfg.claude.use_bedrock);
+    }
+
+    #[test]
+    fn env_overlay_can_disable_bedrock() {
+        let mut cfg = Config::default();
+        cfg.claude.use_bedrock = true;
+        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "false".to_string()));
+        assert!(!cfg.claude.use_bedrock);
+    }
+
+    #[test]
+    fn bedrock_needs_no_anthropic_credential() {
+        let mut cfg = Config {
+            backend: AiBackend::Claude,
+            ..Default::default()
+        };
+        assert!(!cfg.is_claude_configured());
+        cfg.claude.use_bedrock = true;
+        assert!(cfg.is_claude_configured());
+        assert!(cfg.is_backend_configured());
     }
 
     #[test]
