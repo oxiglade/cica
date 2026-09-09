@@ -448,34 +448,20 @@ fn default_linear_listen() -> String {
     "0.0.0.0:8080".to_string()
 }
 
-/// Linear agent channel. Unlike every other channel this one is *inbound*: Linear
-/// POSTs an `AgentSessionEvent` webhook when the app is @mentioned on an issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearConfig {
-    /// The OAuth application's client credentials. Preferred: they mint 30-day
-    /// **app-actor** tokens on demand, so activities are authored by the app
-    /// user and nothing expires under a running channel.
+    /// OAuth client credentials for minting app-actor tokens on demand.
     #[serde(default)]
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
-    /// Accepted and ignored.
-    ///
-    /// A Linear app has a single grant: minting a client-credentials token
-    /// revokes any outstanding authorization-code grant, so a channel holding a
-    /// refresh token loses it as soon as anything else authenticates as the
-    /// same app. Kept only so an existing config does not fail to parse; the
-    /// channel warns if it is set.
+    /// Accepted for configuration compatibility and ignored with a warning.
     #[serde(default)]
     pub refresh_token: String,
-    /// A pre-minted access token. Accepted for local testing only — Linear's
-    /// authorization-code tokens last 24 hours, so a token pasted here stops
-    /// working after a day. Ignored when a refresh token or client credentials
-    /// are set.
+    /// Static access token for local testing; cannot renew and is ignored when both client credentials are configured.
     #[serde(default)]
     pub access_token: String,
-    /// Webhook signing secret, from the webhook's detail page. Used to verify the
-    /// `Linear-Signature` header over the raw request body.
+    /// Webhook signing secret from Linear's webhook detail page.
     #[serde(default)]
     pub webhook_secret: String,
     /// Where the webhook listener binds. Behind a TLS terminator (ALB, reverse
@@ -487,9 +473,7 @@ pub struct LinearConfig {
     #[serde(default)]
     pub shared_identity: bool,
     pub onboarding_prompt: Option<String>,
-    /// Maps a Linear user's email to an identity on another channel, so the same
-    /// human keeps one set of memories and one USER.md. Values are
-    /// `"<channel>:<user_id>"`, e.g. `"slack:U0123ABC"`.
+    /// Maps Linear email addresses to existing identities as `<channel>:<user_id>` (for example, `slack:U0123ABC`).
     #[serde(default)]
     pub identity: HashMap<String, String>,
 }
@@ -521,21 +505,16 @@ impl LinearConfig {
         }
     }
 
-    /// True when the channel has some way to authenticate.
     pub fn has_credential(&self) -> bool {
         (!self.client_id.is_empty() && !self.client_secret.is_empty())
             || !self.access_token.is_empty()
     }
 
-    /// True when the client credentials can be used to refresh an installed
-    /// agent's token, rather than to mint a fresh client-credentials one.
     pub fn can_refresh(&self) -> bool {
         !self.client_id.is_empty() && !self.client_secret.is_empty()
     }
 
-    /// Resolve a Linear commenter to the identity their memories are keyed under.
-    /// Falls back to `("linear", linear_user_id)` when no mapping applies, which
-    /// takes the person through the normal pairing flow.
+    /// Resolve the memory identity, falling back to `("linear", linear_user_id)` when no valid mapping applies.
     pub fn resolve_identity(&self, email: Option<&str>, linear_user_id: &str) -> (String, String) {
         if let Some(email) = email
             && let Some(mapped) = self.identity.get(&email.to_lowercase())
@@ -929,7 +908,6 @@ mod tests {
         let pair = LinearConfig::new("id".into(), "secret".into(), "wh".into());
         assert!(pair.has_credential());
 
-        // Half a pair is not a credential.
         let half = LinearConfig {
             client_id: "id".into(),
             ..Default::default()
@@ -958,8 +936,6 @@ mod tests {
         config.channels.linear = Some(LinearConfig::default());
         assert!(config.configured_channels().contains(&"linear"));
 
-        // Without a channel_settings arm this silently defaults, which would
-        // disable onboarding for every Linear user.
         config.channels.linear = Some(LinearConfig {
             auto_approve: true,
             ..Default::default()

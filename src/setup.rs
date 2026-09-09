@@ -157,7 +157,7 @@ pub enum ClaudeCode {
     Script(PathBuf),
 }
 
-/// Classify executable entries, rejecting npm's text stub and foreign binaries.
+/// Without postinstall, `.bin/claude` can target a shebang-less stub while the platform binary is installed; legitimate text wrappers still need `#!`.
 fn runnable_entry(path: &Path, os: &str) -> Option<ClaudeCode> {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
@@ -217,13 +217,10 @@ pub fn find_claude_code(paths: &Paths) -> Option<ClaudeCode> {
 fn find_claude_code_for_host(paths: &Paths, os: &str, arch: &str) -> Option<ClaudeCode> {
     let modules = paths.claude_code_dir.join("node_modules");
 
-    // What the installer linked, when it linked the real thing.
     if let Some(entry) = runnable_entry(&modules.join(".bin/claude"), os) {
         return Some(entry);
     }
 
-    // Otherwise go to the platform package directly. The link being wrong does
-    // not mean the binary is missing -- it is usually sitting right here.
     let scoped = modules.join("@anthropic-ai");
     let platform = match (os, arch) {
         ("macos", "aarch64") => Some("darwin-arm64"),
@@ -244,7 +241,6 @@ fn find_claude_code_for_host(paths: &Paths, os: &str, arch: &str) -> Option<Clau
         }
     }
 
-    // Legacy layout: a JavaScript entry point run under bun (<= 2.1.112).
     let script = scoped.join("claude-code/cli.js");
     if script.is_file() {
         return Some(ClaudeCode::Script(script));
@@ -870,25 +866,18 @@ mod claude_code_entry_tests {
         (tmp, paths)
     }
 
-    /// The production failure this guards. On 2026-09-09 the router's
-    /// `.bin/claude` pointed at the package's text stub, so every Linear turn
-    /// died with `Exec format error (os error 8)` -- the real binary was sitting
-    /// in the platform package the whole time.
     #[test]
     fn skips_the_text_stub_and_finds_the_platform_binary() {
         let (_t, paths) = paths_with(&[]);
         let modules = paths.claude_code_dir.join("node_modules");
-        // The shim npm ships: text, no NUL bytes.
         write_file(
             &modules.join("@anthropic-ai/claude-code/bin/claude.exe"),
             b"echo \"Error: claude native binary not installed.\" >&2\n",
         );
-        // What the installer *should* have linked, and did install.
         write_file(
             &modules.join("@anthropic-ai/claude-code-linux-x64/claude"),
             b"\x7fELF\x02\x01\x01\0native",
         );
-        // The link, aimed at the stub.
         write_file(
             &modules.join(".bin/claude"),
             b"echo \"Error: claude native binary not installed.\" >&2\n",
@@ -903,7 +892,6 @@ mod claude_code_entry_tests {
         );
     }
 
-    /// A correctly linked install still takes the short path.
     #[test]
     fn prefers_the_link_when_it_points_at_a_real_binary() {
         let (_t, paths) = paths_with(&[]);
@@ -919,7 +907,6 @@ mod claude_code_entry_tests {
         );
     }
 
-    /// Nothing native anywhere: fall back to the legacy script, not the stub.
     #[test]
     fn falls_back_to_the_script_rather_than_a_stub() {
         let (_t, paths) = paths_with(&[]);

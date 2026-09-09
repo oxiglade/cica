@@ -40,10 +40,7 @@ pub trait Channel: Send + Sync + 'static {
     /// Send a text message to the user
     async fn send_message(&self, message: &str) -> Result<()>;
 
-    /// Report a failed turn. Most transports have no notion of an error
-    /// message, so the default is an ordinary send; channels that do (Linear's
-    /// `error` agent activity) override it, which is what stops a timeout from
-    /// reading as a normal answer.
+    /// Report a failed turn; transports without a distinct error message default to `send_message`.
     async fn send_error(&self, message: &str) -> Result<()> {
         self.send_message(message).await
     }
@@ -61,15 +58,7 @@ pub trait Channel: Send + Sync + 'static {
     fn start_typing(&self) -> TypingGuard;
 }
 
-/// Who a turn is attributed to: which memories, `USER.md` and pairing record it
-/// uses.
-///
-/// For most channels this is simply the channel the message arrived on. It is a
-/// separate value because those two things can differ — memories are keyed
-/// `<channel>_<user_id>`, so a channel that can recognise an incoming account as
-/// somebody who already talks to cica elsewhere (Linear knows the commenter's
-/// email) can attribute the turn to that existing identity instead of creating a
-/// second profile for the same human.
+/// Keys memories, `USER.md`, and pairing by `<channel>_<user_id>`, potentially on another channel; `Channel` separately identifies the conversation's display surface.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub channel: String,
@@ -85,9 +74,7 @@ impl Identity {
         }
     }
 
-    /// Attribute the turn to an identity on another channel. Deliberately
-    /// carries no display name: which surface the user is looking at is the
-    /// `Channel`'s to say, not the identity's.
+    /// Attribute the turn to an identity on another channel.
     pub fn mapped(channel: String, user_id: String) -> Self {
         Self { channel, user_id }
     }
@@ -383,15 +370,6 @@ pub async fn execute_claude_query(
     let combined_text = messages.join("\n\n");
     let _typing = channel.start_typing();
 
-    // `identity` decides whose memories and profile this turn sees; `channel` is
-    // where the conversation is actually happening. They are the same for every
-    // channel that cannot recognise its users from elsewhere.
-    //
-    // Keep them apart here. The display name feeds "You are currently
-    // communicating via X", which is about the surface in front of the user, so
-    // it must be the transport: a Linear mention attributed to someone's Slack
-    // identity is still a Linear conversation. Passing the identity's name here
-    // told the agent it was on Slack and it said so in a Linear ticket.
     let user_id = identity.user_id.as_str();
 
     let context_prompt = match onboarding::build_context_prompt_for_user(
@@ -1338,9 +1316,6 @@ mod identity_tests {
 
     #[test]
     fn a_mapped_identity_points_at_the_other_channels_memories() {
-        // This is what lets a Linear mention read the person's Slack USER.md:
-        // memories are keyed <channel>_<user_id>, so the channel has to be the
-        // mapped one, not the transport the comment arrived on.
         let identity = Identity::mapped("slack".into(), "U0123ABC".into());
         assert_eq!(identity.channel, "slack");
         assert_eq!(identity.user_id, "U0123ABC");
@@ -1348,16 +1323,9 @@ mod identity_tests {
 
     #[test]
     fn a_mapped_identity_does_not_decide_which_surface_the_user_sees() {
-        // Regression: the identity used to carry a display name, which fed
-        // "You are currently communicating via X". A Linear mention mapped to
-        // a Slack identity therefore told the agent it was on Slack, and it
-        // wrote "from a Slack conversation" into a Linear ticket. The surface
-        // is the Channel's to report; the identity only says whose memories to
-        // load.
         let identity = Identity::mapped("slack".into(), "U0123ABC".into());
         assert_eq!(identity.channel, "slack");
         assert_eq!(FakeChannel.display_name(), "Slack");
-        // Nothing on Identity can be mistaken for the surface name.
         let _: &str = &identity.channel;
     }
 }

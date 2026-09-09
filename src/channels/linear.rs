@@ -1,23 +1,3 @@
-//! Linear agent channel.
-//!
-//! Every other channel is outbound-only: Telegram long-polls, Slack uses Socket
-//! Mode, Signal talks to a local daemon. This one is the first that *accepts* a
-//! connection — Linear POSTs an `AgentSessionEvent` webhook when the app is
-//! @mentioned on an issue, and the reply goes back out as an "agent activity".
-//!
-//! Two deadlines shape the design:
-//!
-//! * Linear wants HTTP 200 within **5 seconds**, and turns run 40–200s. So the
-//!   handler verifies the signature and claims the delivery before acknowledging
-//!   and running the turn.
-//! * An agent must emit a `thought` activity within **10 seconds** of a session
-//!   opening or Linear marks it failed. `start_typing()` already runs before
-//!   every turn, so the typing indicator *is* the acknowledgement.
-//!
-//! cica never terminates TLS. The listener binds plain HTTP behind a terminator
-//! (an ALB, or a reverse proxy) — but it verifies the HMAC itself regardless,
-//! because the signature is the only thing that proves Linear sent the request.
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::Router;
@@ -54,19 +34,12 @@ const LINEAR_API: &str = "https://api.linear.app/graphql";
 const LINEAR_TOKEN_URL: &str = "https://api.linear.app/oauth/token";
 const LINEAR_SCOPES: &str = "read,write,comments:create,issues:create,app:mentionable";
 
-/// How far a `webhookTimestamp` may be from our own clock. Linear's own guidance
-/// is one minute; being stricter would make us fragile to ordinary clock skew.
+/// Linear recommends a 60-second replay window to tolerate clock skew.
 const TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(60);
 
 /// Header carrying the hex-encoded HMAC-SHA256 of the raw request body.
 const SIGNATURE_HEADER: &str = "linear-signature";
 
-// ---------------------------------------------------------------------------
-// Webhook payloads
-// ---------------------------------------------------------------------------
-
-/// The subset of `AgentSessionEvent` we act on. Linear sends a good deal more;
-/// unknown fields are ignored so a payload addition upstream cannot break us.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentSessionEvent {
@@ -74,11 +47,9 @@ struct AgentSessionEvent {
     /// comment in the same session.
     action: String,
     agent_session: AgentSession,
-    /// Linear pre-formats the issue, its comments and any workspace guidance
-    /// into one string. Cheaper and more faithful than re-fetching the ticket.
+    /// Linear supplies the issue, comments, and workspace guidance preformatted in `promptContext`.
     #[serde(default)]
     prompt_context: Option<String>,
-    /// Present on `prompted`: the comment that triggered this turn.
     #[serde(default)]
     agent_activity: Option<AgentActivity>,
 }
@@ -147,7 +118,6 @@ struct AgentActivityContent {
     body: Option<String>,
 }
 
-/// What the webhook asks us to do, once parsed and stripped of Linear's shape.
 #[derive(Debug, PartialEq, Eq)]
 struct Invocation {
     session_id: String,
@@ -182,8 +152,6 @@ impl AgentSessionEvent {
         )))
     }
 
-    /// Reduce the payload to an invocation, or `None` when there is nothing to
-    /// do (an unhandled action, missing principal, or session with no issue).
     fn to_invocation(&self) -> Option<Invocation> {
         if self.action != "created" && self.action != "prompted" {
             debug!(action = %self.action, "ignoring agent session action");
@@ -243,12 +211,7 @@ impl AgentSessionEvent {
     }
 }
 
-/// Drop the `@Sprout` that addressed us, and nothing else.
-///
-/// Linear delivers the comment as written, so "@Sprout what does this decide?"
-/// arrives with the mention attached — addressing, not instruction. Only
-/// *leading* mentions go: "ask @dave whether it shipped" is context the turn
-/// needs, and stripping every `@word` would throw it away.
+/// Linear includes addressing mentions in the raw comment; retain interior mentions because they identify people discussed.
 fn strip_leading_mentions(text: &str) -> String {
     let mut rest = text.trim_start();
     while let Some(after) = rest.strip_prefix('@') {
@@ -257,10 +220,6 @@ fn strip_leading_mentions(text: &str) -> String {
     }
     rest.trim().to_string()
 }
-
-// ---------------------------------------------------------------------------
-// Signature verification
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum VerifyError {
@@ -271,11 +230,7 @@ pub enum VerifyError {
     MissingTimestamp,
 }
 
-/// Verify a webhook against the signing secret.
-///
-/// The HMAC is computed over the *raw* bytes. Deserializing first and
-/// re-serializing would produce a different byte string and never match, which
-/// is why the handler takes `Bytes` rather than `Json<T>`.
+/// Verify the HMAC over the original request bytes; JSON reserialization can change the signed bytes.
 pub fn verify_signature(
     secret: &str,
     body: &[u8],
@@ -307,12 +262,6 @@ pub fn verify_signature(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Agent activities (the outbound half)
-// ---------------------------------------------------------------------------
-
-/// The activity types Linear accepts. `Thought` and `Action` may be ephemeral —
-/// shown briefly and replaced by whatever the agent emits next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
     Thought,
@@ -336,7 +285,6 @@ impl ActivityKind {
     }
 }
 
-/// Build the `agentActivityCreate` variables for one activity.
 pub fn activity_variables(
     session_id: &str,
     kind: ActivityKind,
@@ -361,31 +309,10 @@ mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
 }
 "#;
 
-/// How Linear requests are authorized.
-///
-/// Linear's OAuth tokens are short-lived: the authorization-code flow issues
-/// 24-hour tokens, so a token pasted into a config file stops working after a
-/// day and the channel goes quiet. The `client_credentials` grant instead
-/// returns a 30-day **app-actor** token with no refresh token, so the channel
-/// holds the client credentials and mints tokens as needed.
-///
-/// A static token is still accepted, because it is what makes local testing
-/// against a personal key possible — it simply cannot renew itself.
+/// Authorization-code tokens last 24 hours; client credentials mint 30-day app tokens without refresh tokens, so renewal requires minting again.
 enum Credential {
     Static(String),
-    /// Mint an app-actor token from the OAuth application's client credentials.
-    ///
-    /// This is the only credential a Linear app can hold safely when anything
-    /// else also authenticates as it. Minting a client-credentials token
-    /// revokes the app's outstanding authorization-code grant -- access token
-    /// and refresh token both -- so a channel holding a refresh token loses it
-    /// the moment a CLI, skill or CI job mints one. The failure is quiet and
-    /// nasty: the turn completes, the work lands, and only the closing activity
-    /// fails, leaving the session running forever.
-    ///
-    /// The `actor=app` installation is still required -- it is what makes
-    /// Linear deliver agent webhooks -- but it is one-time setup and survives
-    /// minting.
+    /// Minting revokes the app's authorization-code access and refresh tokens; the `actor=app` installation still enables webhooks and survives minting.
     ClientCredentials {
         client_id: String,
         client_secret: String,
@@ -396,13 +323,10 @@ enum Credential {
 
 struct CachedToken {
     token: String,
-    /// When to mint a replacement. Deliberately earlier than the real expiry —
-    /// a turn that starts just before the token dies must still finish.
     renew_after: Instant,
 }
 
-/// Renew this far ahead of expiry. A turn runs 40-200s; an hour is generous
-/// enough that no in-flight turn can be holding a token that expires under it.
+/// Renew early so a turn can finish before its token expires.
 const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(3600);
 
 impl Credential {
@@ -460,7 +384,6 @@ impl Credential {
     }
 }
 
-/// Exchange client credentials for an app-actor access token.
 async fn mint_app_token(
     http: &reqwest::Client,
     client_id: &str,
@@ -494,8 +417,7 @@ async fn mint_app_token(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Linear returned no access_token"))?
         .to_string();
-    // Linear currently returns 30 days. Fall back to an hour rather than
-    // trusting a missing field, so a surprise means "renew often", not "never".
+    // If `expires_in` is missing, use a short renewal interval to avoid caching a token indefinitely.
     let expires_in = Duration::from_secs(
         payload
             .get("expires_in")
@@ -505,8 +427,6 @@ async fn mint_app_token(
     Ok((token, expires_in))
 }
 
-/// Minimal GraphQL client. cica already depends on `reqwest`; a generated
-/// client for one mutation would be more machinery than the job needs.
 #[derive(Clone)]
 struct LinearApi {
     http: reqwest::Client,
@@ -561,10 +481,6 @@ impl LinearApi {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Channel impl
-// ---------------------------------------------------------------------------
-
 pub struct LinearChannel {
     api: LinearApi,
     session_id: String,
@@ -592,18 +508,14 @@ impl Channel for LinearChannel {
             .await
     }
 
-    /// A failed turn in a ticket thread is permanent and public, so it goes out
-    /// as an `error` activity — Linear renders it as a failure and moves the
-    /// session to `error` rather than leaving it looking answered.
+    /// An `error` activity puts the Linear session in `error`, so failed turns must use it.
     async fn send_error(&self, message: &str) -> Result<()> {
         self.api
             .create_activity(&self.session_id, ActivityKind::Error, message, false)
             .await
     }
 
-    /// The 10-second acknowledgement. An ephemeral `thought` goes out
-    /// immediately and is replaced by the `response` when the turn lands, so a
-    /// long turn shows as thinking rather than as silence.
+    /// Linear requires a `thought` within 10 seconds of session creation or marks the session failed.
     fn start_typing(&self) -> TypingGuard {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let api = self.api.clone();
@@ -619,24 +531,16 @@ impl Channel for LinearChannel {
                 )
                 .await
             {
-                // Losing the acknowledgement costs us the session, so this is a
-                // warning rather than a debug line.
                 warn!("Failed to post the Linear thought acknowledgement: {}", e);
             }
 
-            // Linear replaces an ephemeral thought with the next activity, so
-            // there is nothing to refresh and nothing to tear down — just hold
-            // the guard's channel so dropping it stays meaningful.
+            // Linear replaces ephemeral thoughts with the next activity, so no refresh or explicit cleanup is needed.
             let _ = cancel_rx.await;
         });
 
         TypingGuard::new(cancel_tx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
 
 const DISPATCH_CLAIMS_KEY: &str = "linear/dispatch-claims";
 const DISPATCH_CLAIM_TTL: Duration = Duration::from_secs(180);
@@ -746,8 +650,6 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
         );
     }
     if config.webhook_secret.is_empty() {
-        // Refusing to start is deliberate: an unverified inbound endpoint on the
-        // router is worse than no Linear channel at all.
         anyhow::bail!("[channels.linear] webhook_secret is empty; refusing to listen unverified");
     }
 
@@ -781,13 +683,6 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
     Ok(())
 }
 
-/// Pick how this channel authenticates.
-///
-/// Client credentials, always, when they are set. A Linear app has a single
-/// grant: minting a client-credentials token revokes any outstanding
-/// authorization-code grant, so a channel that held a refresh token would lose
-/// it as soon as anything else authenticated as the same app. A static token is
-/// a testing affordance and cannot renew itself.
 fn credential_from(config: &LinearConfig, _paths: &crate::config::Paths) -> Credential {
     if !config.refresh_token.is_empty() {
         warn!(
@@ -813,8 +708,6 @@ fn credential_from(config: &LinearConfig, _paths: &crate::config::Paths) -> Cred
     Credential::Static(config.access_token.clone())
 }
 
-/// Load-balancer health check. Deliberately says nothing about the workspace,
-/// the configuration, or whether a turn is in flight.
 async fn health() -> &'static str {
     "ok"
 }
@@ -824,8 +717,6 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         .get(SIGNATURE_HEADER)
         .and_then(|value| value.to_str().ok());
 
-    // Parse only far enough to read the timestamp; nothing is trusted until the
-    // signature checks out.
     let payload = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let timestamp_ms = payload
         .as_ref()
@@ -845,8 +736,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     let event: AgentSessionEvent = match serde_json::from_slice(&body) {
         Ok(event) => event,
         Err(e) => {
-            // A shape we don't understand is not a delivery failure; retrying it
-            // three times would not help.
+            // Acknowledge unsupported payloads because retrying cannot make them parseable.
             let session = payload
                 .as_ref()
                 .and_then(|v| v.pointer("/agentSession/id"))
@@ -889,6 +779,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         .spawn(invocation.session_id.clone(), async move {
             match claim_event(&state, &event_id, &invocation.session_id).await {
                 Ok(true) => {
+                    // Linear requires HTTP 200 within 5 seconds, so acknowledge without awaiting the turn.
                     let _ = acknowledge.send(StatusCode::OK);
                     if let Err(e) = handle_invocation(state, invocation).await {
                         warn!("Linear turn failed: {}", e);
@@ -929,9 +820,6 @@ async fn claim_event(
 }
 
 async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()> {
-    // Memories and USER.md are keyed <channel>_<user_id>, so without a mapping
-    // the same human is a stranger on Linear. Resolve to their identity on
-    // whichever channel they normally use.
     let (identity_channel, identity_user) = state
         .config
         .resolve_identity(invocation.user_email.as_deref(), &invocation.user_id);
@@ -970,8 +858,6 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
         return Ok(());
     };
 
-    // Linear's own promptContext carries the issue, its comments and any
-    // workspace guidance, already formatted.
     let prompt = match invocation.context.as_deref() {
         Some(context) if !context.is_empty() => {
             format!("{context}\n\n---\n\n{query_text}")
@@ -983,13 +869,7 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
         state.rt.clone(),
         channel,
         &Identity::mapped(identity_channel, identity_user),
-        // Deliberately `Chat` keyed by issue rather than a new Affinity variant.
-        // Affinity is serialized into the TurnJob the worker deserializes, so a
-        // new variant is a breaking wire change: a router on this version would
-        // hand a job to a released worker that fails with "unknown variant" and
-        // the turn hangs until it times out. Router and worker are meant to be
-        // updatable in either order, so this keys the same one-warm-worker-per-
-        // issue behaviour using a shape every existing worker already accepts.
+        // Use the existing `Chat` wire shape because released workers may predate the router and reject new `Affinity` variants.
         Affinity::Chat {
             channel: "linear".to_string(),
             user: invocation.issue_id.clone(),
@@ -1003,10 +883,7 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
     Ok(())
 }
 
-/// Validate credentials; returns the app user's display name on success.
-/// `viewer` on an app-actor token resolves to the app user, which is exactly the
-/// identity whose name will appear on every activity — so this both proves the
-/// credentials work and shows the operator who Linear thinks they are.
+/// Validate credentials; return the app user's display name on success.
 pub async fn validate_credentials(client_id: &str, client_secret: &str) -> Result<String> {
     let http = linear_http_client_builder()
         .build()
@@ -1614,7 +1491,6 @@ mod tests {
         assert_eq!(inv.user_email.as_deref(), Some("Rodrigo@RootGlobal.io"));
         assert_eq!(inv.user_name.as_deref(), Some("rodrigo"));
         assert_eq!(inv.title.as_deref(), Some("Trigger Sprout"));
-        // The mention is addressing, not instruction.
         assert_eq!(inv.prompt, "what does this ticket decide?");
         assert_eq!(inv.context.as_deref(), Some("<issue>DAT-633</issue>"));
     }
@@ -1625,8 +1501,6 @@ mod tests {
         let inv = event.to_invocation().unwrap();
 
         assert_eq!(inv.prompt, "and what about the estimate?");
-        // Same issue, so the same session key — this is what makes a follow-up
-        // resume rather than start cold.
         assert_eq!(inv.issue_id, "iss_abc");
         assert_eq!(inv.context, None);
     }
@@ -1675,7 +1549,6 @@ mod tests {
         let http = linear_http_client_builder().no_proxy().build().unwrap();
         let cred = Credential::Static("lin_static".into());
         assert_eq!(cred.token(&http).await.unwrap(), "lin_static");
-        // Repeated reads must not drift; a static token has nothing to renew.
         assert_eq!(cred.token(&http).await.unwrap(), "lin_static");
     }
 
@@ -1708,9 +1581,6 @@ mod tests {
                 renew_after: Instant::now() - Duration::from_secs(1),
             })),
         };
-        // Past the deadline it must try to mint rather than hand back `stale`.
-        // Minting with bogus credentials fails, and failing is the correct
-        // outcome here -- what must not happen is a stale token being served.
         if let Ok(token) = cred.token(&http).await {
             panic!("served a token past its renewal deadline: {token}");
         }
@@ -1736,13 +1606,6 @@ mod tests {
         assert_eq!(fallback, Duration::from_secs(150));
     }
 
-    /// Hits the live Linear API. Ignored by default; run it against a real
-    /// OAuth application when changing the token exchange:
-    ///
-    /// ```text
-    /// CICA_LINEAR_CLIENT_ID=... CICA_LINEAR_CLIENT_SECRET=... \
-    ///   cargo test --all-features mints_a_real_app_token -- --ignored --nocapture
-    /// ```
     #[tokio::test]
     #[ignore = "requires live Linear credentials"]
     async fn mints_a_real_app_token_and_it_resolves_to_the_app_user() {
@@ -1755,8 +1618,7 @@ mod tests {
             .await
             .expect("minting an app token");
         assert!(!token.is_empty());
-        // Client-credentials tokens are 30 days; anything under a day means the
-        // grant changed and the renewal margin needs revisiting.
+        // The one-day lower bound detects a changed token grant that warrants reviewing the renewal margin.
         assert!(
             expires_in > Duration::from_secs(86_400),
             "expires_in unexpectedly short: {expires_in:?}"
@@ -1771,16 +1633,6 @@ mod tests {
 
     #[test]
     fn client_credentials_win_whenever_they_are_configured() {
-        // A Linear app has ONE grant. Minting a client-credentials token
-        // revokes any outstanding authorization-code grant, access and refresh
-        // both -- so a channel holding a refresh token loses it the moment a
-        // skill, CLI or CI job authenticates as the same app. Observed in
-        // production: the turn completed and posted its work, then the closing
-        // activity 401'd and the session hung "running" forever.
-        //
-        // So this must not grow a preference for a refresh token again. The
-        // actor=app installation is still required for webhook delivery, but it
-        // is one-time setup and survives minting.
         let (_t, paths) = crate::config::test_paths();
 
         let config = LinearConfig::new("id".into(), "secret".into(), "wh".into());
@@ -1789,7 +1641,6 @@ mod tests {
             Credential::ClientCredentials { .. }
         ));
 
-        // Even with a refresh token sitting in config, minting still wins.
         let mut with_refresh = LinearConfig::new("id".into(), "secret".into(), "wh".into());
         with_refresh.refresh_token = "seed".into();
         assert!(matches!(
@@ -1809,15 +1660,7 @@ mod tests {
 
     #[test]
     fn a_linear_turn_uses_an_affinity_released_workers_can_decode() {
-        // Affinity is serialized into the TurnJob that a worker deserializes.
-        // Workers run a released image which may predate the router, so adding
-        // an Affinity variant is a BREAKING WIRE CHANGE: the worker fails with
-        // "unknown variant", leaves the job consumed to prevent replay, and the
-        // turn hangs until it times out. This cost a live debugging session.
-        //
-        // If the match below stops compiling because you added a variant, that
-        // is the point: ship the worker image before the router, or key your
-        // affinity with a shape existing workers already accept.
+        // The exhaustive match deliberately fails to compile when an `Affinity` variant is added, forcing a compatibility review.
         let affinity = Affinity::Chat {
             channel: "linear".to_string(),
             user: "iss_abc".to_string(),
@@ -1832,7 +1675,6 @@ mod tests {
             "Linear turns must ride the Chat shape, got {wire}"
         );
 
-        // Same issue, same worker; different issues, different workers.
         let same = Affinity::Chat {
             channel: "linear".to_string(),
             user: "iss_abc".to_string(),
@@ -1862,7 +1704,6 @@ mod tests {
 
     #[test]
     fn a_mention_inside_the_question_is_context_and_survives() {
-        // Stripping every @word would lose who the turn is being asked about.
         assert_eq!(
             strip_leading_mentions("@Sprout did @dave say it shipped?"),
             "did @dave say it shipped?"

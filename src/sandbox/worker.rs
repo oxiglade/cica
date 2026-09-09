@@ -965,6 +965,7 @@ pub async fn run_worker_loop<P: SandboxProvider>(
             }
         }
         let turn_id = inbox.turn_id.clone();
+        // Drop the run future before preservation so cancellation releases the provider's resources.
         let (outcome, abandoned) = {
             let run = engine.run_turn(job.clone());
             tokio::pin!(run);
@@ -975,6 +976,7 @@ pub async fn run_worker_loop<P: SandboxProvider>(
             }
         };
         if abandoned {
+            // Preserve the transcript before `abandon` deletes the local session.
             if tokio::time::timeout(
                 PRESERVATION_TIMEOUT,
                 engine.preserve_abandoned(&job, &turn_id),
@@ -2442,20 +2444,13 @@ mod warm_protocol_tests {
         task.abort();
     }
 
-    /// A turn that times out returns no result, so nothing is persisted -- and
-    /// then `abandon` deletes the local session. The one turn worth reading was
-    /// the one that left nothing at all: a 900s timeout had to be diagnosed from
-    /// router logs and inference, because no transcript survived it anywhere.
-    ///
-    /// Drives the loop rather than calling preserve_abandoned directly, because
-    /// what matters is that it runs BEFORE the discard.
+    /// Exercise the worker loop to verify preservation happens before local state is discarded.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_turn_leaves_its_transcript_behind() {
         let root = tempfile::tempdir().unwrap();
         let store: Arc<dyn StateStore> =
             Arc::new(FilesystemStateStore::new(root.path().join("store")));
 
-        // The transcript Claude Code would have written while the turn ran.
         let claude_home = root.path().join("claude");
         let transcript = claude_home.join(".claude/projects/-work/sess-timeout.jsonl");
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
@@ -2474,7 +2469,6 @@ mod warm_protocol_tests {
             spawn_loop(root.path(), store.clone(), NeverReturns, timing()).await;
         assign(store.as_ref(), &affinity, &worker, "t-timeout").await;
 
-        // Past the turn timeout.
         for _ in 0..400 {
             if store
                 .get_record(&result_key("t-timeout"))
@@ -2500,8 +2494,6 @@ mod warm_protocol_tests {
             "preserved the wrong thing"
         );
 
-        // And it must not be resumable: a turn cut mid-flight restored into a
-        // thread would carry a broken conversation forward.
         assert!(
             !store
                 .pull("session/sess-timeout", &root.path().join("as-session"))

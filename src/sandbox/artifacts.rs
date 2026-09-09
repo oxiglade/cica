@@ -22,12 +22,7 @@ pub trait SessionArtifacts {
     fn restore(&self, home: &Path, cwd: &Path, session_id: &str, staging: &Path) -> Result<()>;
     fn forget(&self, home: &Path, session_id: &str) -> Result<()>;
 
-    /// The session most recently written in `home`, if the backend can tell.
-    ///
-    /// A turn that times out never reports a session id -- there is no result to
-    /// carry one -- so a *fresh* turn cannot be captured by name. This is the
-    /// only way to find what it left behind. Default `None`: a backend that
-    /// cannot answer should say so rather than guess.
+    /// Return the most recently written session in `home`, or `None` if the backend cannot determine it.
     fn latest_session(&self, _home: &Path) -> Option<String> {
         None
     }
@@ -141,9 +136,7 @@ impl SessionArtifacts for ClaudeSessionArtifacts {
     fn restore(&self, home: &Path, cwd: &Path, session_id: &str, staging: &Path) -> Result<()> {
         ClaudeSessionArtifacts::restore(home, cwd, session_id, staging)
     }
-    /// Newest `projects/<slug>/<session>.jsonl` by mtime. Claude Code writes the
-    /// transcript as the turn runs, so a timed-out turn has one even though it
-    /// never returned an id.
+    /// Claude Code writes `.jsonl` transcripts during execution, so they survive a timeout without a returned session ID.
     fn latest_session(&self, home: &Path) -> Option<String> {
         let projects = home.join(".claude").join("projects");
         let mut newest: Option<(std::time::SystemTime, String)> = None;
@@ -485,17 +478,13 @@ mod tests {
         assert!(dot.join("todos/two-agent.json").exists());
     }
 
-    /// A timed-out turn never reports a session id, so a fresh turn can only be
-    /// found by looking for what was written last. Without this, the one turn
-    /// worth reading is the one that leaves nothing behind.
     #[test]
     fn latest_session_finds_the_most_recently_written_transcript() {
         let home = tempfile::tempdir().unwrap();
         let projects = home.path().join(".claude/projects");
         write(&projects.join("-work-a/older.jsonl"), "{}");
         write(&projects.join("-work-b/newer.jsonl"), "{}");
-        // Both files are written in the same instant, so age one explicitly
-        // rather than relying on filesystem mtime resolution.
+        // Set distinct mtimes explicitly because filesystem timestamp resolution can make consecutive writes indistinguishable.
         let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
         fs::File::options()
             .write(true)
@@ -517,7 +506,6 @@ mod tests {
         assert_eq!(ClaudeSessionArtifacts.latest_session(home.path()), None);
     }
 
-    /// Only `.jsonl` files are transcripts; the projects dir holds other things.
     #[test]
     fn latest_session_ignores_non_transcripts() {
         let home = tempfile::tempdir().unwrap();
@@ -526,7 +514,6 @@ mod tests {
         assert_eq!(ClaudeSessionArtifacts.latest_session(home.path()), None);
     }
 
-    /// Cursor cannot answer, and says so rather than guessing.
     #[test]
     fn cursor_does_not_pretend_to_know_the_latest_session() {
         let home = tempfile::tempdir().unwrap();

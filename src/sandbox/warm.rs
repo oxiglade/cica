@@ -77,21 +77,7 @@ impl<P: SandboxProvider> WarmHydratingProvider<P> {
         }
     }
 
-    /// Save what an abandoned turn left behind, before `abandon` discards it.
-    ///
-    /// A turn that times out returns no result, so the dehydrate step below
-    /// never runs and nothing is persisted -- and then `forget_local` deletes
-    /// the local copy. The one turn we most need to read is the one that
-    /// leaves nothing at all, which is how a 900s timeout was diagnosed from
-    /// router logs and inference.
-    ///
-    /// Deliberately **not** `session/<id>`: a turn cut mid-flight must never
-    /// become resumable, or the next message in that thread restores a broken
-    /// conversation. This is a copy for humans, under `abandoned/<turn_id>`,
-    /// and nothing reads it back.
-    ///
-    /// Best-effort throughout. The turn has already failed; failing to file the
-    /// evidence must not make that worse.
+    /// Best-effort capture before `abandon` discards local state; store under `abandoned/<turn_id>` for diagnosis because interrupted sessions must never become resumable.
     pub async fn preserve_abandoned(&self, job: &TurnJob, turn_id: &str) {
         let backend = job.backend;
         let home = match backend {
@@ -105,8 +91,6 @@ impl<P: SandboxProvider> WarmHydratingProvider<P> {
                 AiBackend::Claude => &ClaudeSessionArtifacts,
                 AiBackend::Cursor => &CursorSessionArtifacts,
             };
-            // A resumed turn knows its session. A fresh one never reported an id,
-            // so fall back to whatever was written last.
             let Some(session) = resume.or_else(|| artifacts.latest_session(&home)) else {
                 return Ok(None);
             };
