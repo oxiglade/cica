@@ -8,7 +8,8 @@
 //! Two deadlines shape the design:
 //!
 //! * Linear wants HTTP 200 within **5 seconds**, and turns run 40–200s. So the
-//!   handler verifies the signature, acknowledges, and spawns the turn.
+//!   handler verifies the signature and claims the delivery before acknowledging
+//!   and running the turn.
 //! * An agent must emit a `thought` activity within **10 seconds** of a session
 //!   opening or Linear marks it failed. `start_typing()` already runs before
 //!   every turn, so the typing indicator *is* the acknowledgement.
@@ -27,7 +28,8 @@ use axum::routing::{get, post};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -40,6 +42,13 @@ use super::{
 use crate::config::LinearConfig;
 use crate::runtime::Runtime;
 use crate::sandbox::Affinity;
+use crate::sandbox::state::{FilesystemStateStore, StateStore, default_store, resolved_state_path};
+
+const LINEAR_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn linear_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().timeout(LINEAR_HTTP_TIMEOUT)
+}
 
 const LINEAR_API: &str = "https://api.linear.app/graphql";
 const LINEAR_TOKEN_URL: &str = "https://api.linear.app/oauth/token";
@@ -81,8 +90,6 @@ struct AgentSession {
     #[serde(default)]
     issue: Option<Issue>,
     #[serde(default)]
-    creator: Option<User>,
-    #[serde(default)]
     comment: Option<Comment>,
 }
 
@@ -99,6 +106,7 @@ struct Issue {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct User {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     email: Option<String>,
@@ -120,6 +128,14 @@ struct Comment {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentActivity {
+    #[serde(default)]
+    signal: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    user: Option<User>,
     #[serde(default)]
     content: Option<AgentActivityContent>,
 }
@@ -147,15 +163,32 @@ struct Invocation {
 }
 
 impl AgentSessionEvent {
+    fn event_id(&self) -> Option<String> {
+        if self.agent_session.id.trim().is_empty() {
+            return None;
+        }
+        let activity = match self.action.as_str() {
+            "created" => "created",
+            "prompted" => self
+                .agent_activity
+                .as_ref()?
+                .id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())?,
+            _ => return None,
+        };
+        Some(hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&self.agent_session.id, &self.action, activity)).ok()?,
+        )))
+    }
+
     /// Reduce the payload to an invocation, or `None` when there is nothing to
-    /// do (an action we don't handle, or a session with no issue behind it).
+    /// do (an unhandled action, missing principal, or session with no issue).
     fn to_invocation(&self) -> Option<Invocation> {
         if self.action != "created" && self.action != "prompted" {
             debug!(action = %self.action, "ignoring agent session action");
             return None;
         }
-
-        let issue = self.agent_session.issue.as_ref()?;
 
         // On `created` the triggering text is the comment that mentioned us; on
         // `prompted` it arrives as the activity body.
@@ -172,18 +205,35 @@ impl AgentSessionEvent {
             })
             .unwrap_or_default();
 
-        let commenter = self
-            .agent_session
-            .comment
-            .as_ref()
-            .and_then(|c| c.user.as_ref())
-            .or(self.agent_session.creator.as_ref());
+        let (user_id, commenter) = match self.action.as_str() {
+            "prompted" => {
+                let activity = self.agent_activity.as_ref();
+                let id = activity.and_then(|a| a.user_id.as_deref());
+                let user = activity
+                    .and_then(|a| a.user.as_ref())
+                    .filter(|u| Some(u.id.as_str()) == id);
+                (id, user)
+            }
+            _ => {
+                let user = self
+                    .agent_session
+                    .comment
+                    .as_ref()
+                    .and_then(|c| c.user.as_ref());
+                (user.map(|u| u.id.as_str()), user)
+            }
+        };
+        let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) else {
+            warn!(session = %self.agent_session.id, "Refusing Linear event without a principal");
+            return None;
+        };
 
+        let issue = self.agent_session.issue.as_ref()?;
         Some(Invocation {
             session_id: self.agent_session.id.clone(),
             issue_id: issue.id.clone(),
             issue_ref: issue.identifier.clone().unwrap_or_else(|| issue.id.clone()),
-            user_id: commenter.map(|u| u.id.clone()).unwrap_or_default(),
+            user_id: user_id.to_string(),
             user_email: commenter.and_then(|u| u.email.clone()),
             user_name: commenter.and_then(|u| u.display_name.clone().or(u.name.clone())),
             title: issue.title.clone(),
@@ -218,6 +268,7 @@ pub enum VerifyError {
     BadEncoding,
     Mismatch,
     StaleTimestamp,
+    MissingTimestamp,
 }
 
 /// Verify a webhook against the signing secret.
@@ -244,17 +295,13 @@ pub fn verify_signature(
         return Err(VerifyError::Mismatch);
     }
 
-    // Replay guard. A payload without a timestamp still verifies — the field is
-    // documented but optional, and rejecting on its absence would drop valid
-    // deliveries.
-    if let Some(timestamp_ms) = timestamp_ms {
-        let now_ms = now
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        if (now_ms - timestamp_ms).unsigned_abs() > TIMESTAMP_TOLERANCE.as_millis() as u64 {
-            return Err(VerifyError::StaleTimestamp);
-        }
+    let timestamp_ms = timestamp_ms.ok_or(VerifyError::MissingTimestamp)?;
+    let now_ms = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    if now_ms.abs_diff(timestamp_ms) > TIMESTAMP_TOLERANCE.as_millis() as u64 {
+        return Err(VerifyError::StaleTimestamp);
     }
 
     Ok(())
@@ -343,6 +390,7 @@ enum Credential {
         client_id: String,
         client_secret: String,
         cached: tokio::sync::RwLock<Option<CachedToken>>,
+        mint_lock: tokio::sync::Mutex<()>,
     },
 }
 
@@ -359,12 +407,22 @@ const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(3600);
 
 impl Credential {
     async fn token(&self, http: &reqwest::Client) -> Result<String> {
+        self.token_with_mint(|id, secret| mint_app_token(http, id, secret))
+            .await
+    }
+
+    async fn token_with_mint<'a, F, Fut>(&'a self, mint: F) -> Result<String>
+    where
+        F: FnOnce(&'a str, &'a str) -> Fut,
+        Fut: std::future::Future<Output = Result<(String, Duration)>>,
+    {
         match self {
             Self::Static(token) => Ok(token.clone()),
             Self::ClientCredentials {
                 client_id,
                 client_secret,
                 cached,
+                mint_lock,
             } => {
                 if let Some(current) = cached.read().await.as_ref()
                     && Instant::now() < current.renew_after
@@ -372,15 +430,18 @@ impl Credential {
                     return Ok(current.token.clone());
                 }
 
-                let mut guard = cached.write().await;
+                let _mint_guard = mint_lock.lock().await;
                 // Another task may have minted one while we waited for the lock.
-                if let Some(current) = guard.as_ref()
+                if let Some(current) = cached.read().await.as_ref()
                     && Instant::now() < current.renew_after
                 {
                     return Ok(current.token.clone());
                 }
 
-                let (token, expires_in) = mint_app_token(http, client_id, client_secret).await?;
+                let (token, expires_in) =
+                    tokio::time::timeout(LINEAR_HTTP_TIMEOUT, mint(client_id, client_secret))
+                        .await
+                        .context("Linear token mint timed out")??;
                 let renew_after = Instant::now()
                     + expires_in
                         .checked_sub(TOKEN_RENEW_MARGIN)
@@ -389,7 +450,7 @@ impl Credential {
                     "Minted a Linear app token, renewing in {}h",
                     (renew_after - Instant::now()).as_secs() / 3600
                 );
-                *guard = Some(CachedToken {
+                *cached.write().await = Some(CachedToken {
                     token: token.clone(),
                     renew_after,
                 });
@@ -455,7 +516,9 @@ struct LinearApi {
 impl LinearApi {
     fn new(credential: Credential) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: linear_http_client_builder()
+                .build()
+                .expect("build Linear HTTP client"),
             credential: Arc::new(credential),
         }
     }
@@ -575,8 +638,102 @@ impl Channel for LinearChannel {
 // Server
 // ---------------------------------------------------------------------------
 
+const DISPATCH_CLAIMS_KEY: &str = "linear/dispatch-claims";
+const DISPATCH_CLAIM_TTL: Duration = Duration::from_secs(180);
+const MAX_DISPATCH_CLAIMS: usize = 10_000;
+
+async fn claim_dispatch(store: &dyn StateStore, event_id: &str, now: u64) -> Result<bool> {
+    loop {
+        let previous = store.get_record(DISPATCH_CLAIMS_KEY).await?;
+        let mut claims: BTreeMap<String, u64> = match &previous {
+            Some(bytes) => serde_json::from_slice(bytes)?,
+            None => BTreeMap::new(),
+        };
+        claims.retain(|_, expiry| *expiry > now);
+        if claims.contains_key(event_id) {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            claims.len() < MAX_DISPATCH_CLAIMS,
+            "Linear dispatch ledger full"
+        );
+        claims.insert(event_id.to_string(), now + DISPATCH_CLAIM_TTL.as_secs());
+        if store
+            .compare_exchange_record(
+                DISPATCH_CLAIMS_KEY,
+                previous.as_deref(),
+                &serde_json::to_vec(&claims)?,
+            )
+            .await?
+        {
+            return Ok(true);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+type SessionTurns = std::collections::HashMap<
+    String,
+    std::collections::HashMap<uuid::Uuid, tokio::task::AbortHandle>,
+>;
+
+#[derive(Clone, Default)]
+struct InFlightTurns(Arc<std::sync::Mutex<SessionTurns>>);
+
+struct InFlightTurn {
+    turns: InFlightTurns,
+    session: String,
+    id: uuid::Uuid,
+}
+
+impl Drop for InFlightTurn {
+    fn drop(&mut self) {
+        let mut sessions = crate::runtime::lock(&self.turns.0);
+        if let Some(turns) = sessions.get_mut(&self.session) {
+            turns.remove(&self.id);
+            if turns.is_empty() {
+                sessions.remove(&self.session);
+            }
+        }
+    }
+}
+
+impl InFlightTurns {
+    fn spawn(
+        &self,
+        session: String,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let id = uuid::Uuid::new_v4();
+        let guard = InFlightTurn {
+            turns: self.clone(),
+            session: session.clone(),
+            id,
+        };
+        let mut sessions = crate::runtime::lock(&self.0);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            future.await;
+        });
+        sessions
+            .entry(session)
+            .or_default()
+            .insert(id, task.abort_handle());
+    }
+
+    fn stop(&self, session: &str) {
+        if let Some(turns) = crate::runtime::lock(&self.0).remove(session) {
+            for handle in turns.into_values() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
+    in_flight: InFlightTurns,
+    store: Arc<dyn StateStore>,
     config: Arc<LinearConfig>,
     api: LinearApi,
     rt: Arc<Runtime>,
@@ -596,6 +753,12 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
 
     let listen_addr = config.listen_addr.clone();
     let state = AppState {
+        in_flight: InFlightTurns::default(),
+        store: default_store(&rt.config, &rt.paths)?.unwrap_or_else(|| {
+            Arc::new(FilesystemStateStore::new(resolved_state_path(
+                &rt.config, &rt.paths,
+            )))
+        }),
         api: LinearApi::new(credential_from(&config, &rt.paths)),
         config: Arc::new(config),
         rt,
@@ -638,6 +801,7 @@ fn credential_from(config: &LinearConfig, _paths: &crate::config::Paths) -> Cred
         return Credential::ClientCredentials {
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
+            mint_lock: tokio::sync::Mutex::new(()),
             cached: tokio::sync::RwLock::new(None),
         };
     }
@@ -662,8 +826,9 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
 
     // Parse only far enough to read the timestamp; nothing is trusted until the
     // signature checks out.
-    let timestamp_ms = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let payload = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let timestamp_ms = payload
+        .as_ref()
         .and_then(|v| v.get("webhookTimestamp").and_then(|t| t.as_i64()));
 
     if let Err(e) = verify_signature(
@@ -682,7 +847,12 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         Err(e) => {
             // A shape we don't understand is not a delivery failure; retrying it
             // three times would not help.
-            debug!("Ignoring an unparseable Linear webhook: {}", e);
+            let session = payload
+                .as_ref()
+                .and_then(|v| v.pointer("/agentSession/id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            warn!(%session, "Refusing an unparseable Linear webhook: {}", e);
             return StatusCode::OK;
         }
     };
@@ -691,15 +861,71 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         return StatusCode::OK;
     };
 
-    // Acknowledge now and work afterwards: Linear's budget is 5s, a turn is
-    // 40-200s.
-    tokio::spawn(async move {
-        if let Err(e) = handle_invocation(state, invocation).await {
-            warn!("Linear turn failed: {}", e);
-        }
-    });
+    let Some(event_id) = event.event_id() else {
+        warn!(session = %event.agent_session.id, "Refusing Linear event without an event identity");
+        return StatusCode::OK;
+    };
+    if event
+        .agent_activity
+        .as_ref()
+        .and_then(|activity| activity.signal.as_deref())
+        == Some("stop")
+    {
+        return match claim_event(&state, &event_id, &invocation.session_id).await {
+            Ok(true) => {
+                state.in_flight.stop(&invocation.session_id);
+                StatusCode::OK
+            }
+            Ok(false) => StatusCode::OK,
+            Err(status) => status,
+        };
+    }
 
-    StatusCode::OK
+    // Register before claiming so a stop also cancels deliveries waiting on storage.
+    let (acknowledge, response) = oneshot::channel();
+    state
+        .in_flight
+        .clone()
+        .spawn(invocation.session_id.clone(), async move {
+            match claim_event(&state, &event_id, &invocation.session_id).await {
+                Ok(true) => {
+                    let _ = acknowledge.send(StatusCode::OK);
+                    if let Err(e) = handle_invocation(state, invocation).await {
+                        warn!("Linear turn failed: {}", e);
+                    }
+                }
+                Ok(false) => {
+                    let _ = acknowledge.send(StatusCode::OK);
+                }
+                Err(status) => {
+                    let _ = acknowledge.send(status);
+                }
+            }
+        });
+    response.await.unwrap_or(StatusCode::OK)
+}
+
+async fn claim_event(
+    state: &AppState,
+    event_id: &str,
+    session: &str,
+) -> std::result::Result<bool, StatusCode> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        claim_dispatch(state.store.as_ref(), event_id, now),
+    )
+    .await
+    {
+        Ok(Ok(claimed)) => Ok(claimed),
+        error => {
+            warn!(%session, ?error, "Could not claim Linear dispatch");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()> {
@@ -782,7 +1008,9 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
 /// identity whose name will appear on every activity — so this both proves the
 /// credentials work and shows the operator who Linear thinks they are.
 pub async fn validate_credentials(client_id: &str, client_secret: &str) -> Result<String> {
-    let http = reqwest::Client::new();
+    let http = linear_http_client_builder()
+        .build()
+        .expect("build Linear HTTP client");
     let (token, _) = mint_app_token(&http, client_id, client_secret).await?;
     let response = http
         .post(LINEAR_API)
@@ -820,6 +1048,402 @@ pub async fn send_activity(
 mod tests {
     use super::*;
 
+    struct RecordingProvider(tokio::sync::mpsc::UnboundedSender<crate::sandbox::TurnJob>);
+
+    #[async_trait]
+    impl crate::sandbox::SandboxProvider for RecordingProvider {
+        async fn run_turn(
+            &self,
+            job: crate::sandbox::TurnJob,
+        ) -> Result<crate::sandbox::TurnResult> {
+            self.0.send(job).unwrap();
+            Ok(crate::sandbox::TurnResult {
+                response: "done".into(),
+                backend_session_id: String::new(),
+                cost_usd: None,
+                duration_ms: None,
+                produced_files: vec![],
+            })
+        }
+    }
+
+    fn webhook_state(
+        paths: &crate::config::Paths,
+    ) -> (
+        AppState,
+        tokio::sync::mpsc::UnboundedReceiver<crate::sandbox::TurnJob>,
+    ) {
+        for user in ["usr_1", "usr_2"] {
+            let dir = crate::onboarding::user_dir(paths, "linear", user);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("USER.md"), user).unwrap();
+            std::fs::write(dir.join("IDENTITY.md"), "Assistant").unwrap();
+        }
+        let linear = LinearConfig {
+            auto_approve: true,
+            webhook_secret: "shh".into(),
+            ..Default::default()
+        };
+        let mut config = crate::config::Config::default();
+        config.channels.linear = Some(linear.clone());
+        let config = Arc::new(config);
+        let paths = Arc::new(paths.clone());
+        let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+        let provider: Arc<dyn crate::sandbox::SandboxProvider> = Arc::new(RecordingProvider(sent));
+        let cron = crate::cron::CronService::new(
+            crate::cron::SystemClock,
+            Default::default(),
+            config.clone(),
+            paths.clone(),
+            provider.clone(),
+        )
+        .unwrap();
+        let rt = Arc::new(Runtime {
+            config,
+            provider,
+            cron,
+            pairing: std::sync::Mutex::new(crate::pairing::PairingStore::load(&paths).unwrap()),
+            paths,
+            session_locks: Default::default(),
+            session_ticket: Default::default(),
+        });
+        (
+            AppState {
+                in_flight: InFlightTurns::default(),
+                store: Arc::new(FilesystemStateStore::new(resolved_state_path(
+                    &rt.config, &rt.paths,
+                ))),
+                config: Arc::new(linear),
+                rt,
+                api: LinearApi {
+                    http: reqwest::Client::builder()
+                        .no_proxy()
+                        .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+                        .timeout(Duration::from_millis(100))
+                        .build()
+                        .unwrap(),
+                    credential: Arc::new(Credential::Static("test".into())),
+                },
+            },
+            received,
+        )
+    }
+
+    fn signed_payload(mut payload: serde_json::Value) -> (HeaderMap, Bytes) {
+        payload["webhookTimestamp"] = json!(now_ms());
+        payload["webhookId"] = json!("delivery-1");
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(SIGNATURE_HEADER, sign("shh", &body).parse().unwrap());
+        (headers, body)
+    }
+
+    #[tokio::test]
+    async fn the_same_signed_body_delivered_twice_dispatches_once() {
+        let (_temp, paths) = crate::config::test_paths();
+        let (state, mut jobs) = webhook_state(&paths);
+        let (headers, body) = signed_payload(serde_json::from_str(CREATED).unwrap());
+        assert_eq!(
+            webhook(State(state.clone()), headers.clone(), body.clone()).await,
+            StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(2), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            webhook(State(state.clone()), headers, body).await,
+            StatusCode::OK
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), jobs.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unidentified_prompted_event_dispatches_nothing() {
+        let (_temp, paths) = crate::config::test_paths();
+        let (state, mut jobs) = webhook_state(&paths);
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        payload["action"] = json!("prompted");
+        let (headers, body) = signed_payload(payload);
+        assert_eq!(webhook(State(state), headers, body).await, StatusCode::OK);
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(100), jobs.recv()).await,
+            Ok(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_only_its_sessions_in_flight_turn_and_never_dispatches_a_prompt() {
+        struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        struct Blocking {
+            entered: tokio::sync::mpsc::UnboundedSender<String>,
+            dropped: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::sandbox::SandboxProvider for Blocking {
+            async fn run_turn(
+                &self,
+                job: crate::sandbox::TurnJob,
+            ) -> Result<crate::sandbox::TurnResult> {
+                let _guard = Guard(self.dropped.clone());
+                self.entered.send(job.prompt).unwrap();
+                std::future::pending().await
+            }
+        }
+        let (_temp, paths) = crate::config::test_paths();
+        let (mut state, _) = webhook_state(&paths);
+        let (entered, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::get_mut(&mut state.rt).unwrap().provider = Arc::new(Blocking {
+            entered,
+            dropped: dropped.clone(),
+        });
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        let (headers, body) = signed_payload(payload.clone());
+        webhook(State(state.clone()), headers, body).await;
+        tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        payload["agentSession"]["id"] = json!("sess_2");
+        payload["agentSession"]["issue"]["id"] = json!("issue_2");
+        let (headers, body) = signed_payload(payload);
+        webhook(State(state.clone()), headers, body).await;
+        tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut stop: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        stop["action"] = json!("prompted");
+        stop["agentActivity"] = json!({"id": "stop-1", "userId": "usr_2", "signal": "stop", "content": {"body": "stop now"}});
+        let (headers, body) = signed_payload(stop.clone());
+        webhook(State(state.clone()), headers, body).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(received.try_recv().is_err());
+        stop["agentSession"]["id"] = json!("sess_2");
+        stop["agentActivity"]["id"] = json!("stop-2");
+        let (headers, body) = signed_payload(stop);
+        webhook(State(state.clone()), headers, body).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn token_mint_does_not_hold_the_cache_write_lock() {
+        let credential = Credential::ClientCredentials {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            mint_lock: tokio::sync::Mutex::new(()),
+            cached: tokio::sync::RwLock::new(None),
+        };
+        let started = tokio::sync::Notify::new();
+        let mint = credential.token_with_mint(|_, _| async {
+            started.notify_one();
+            std::future::pending().await
+        });
+        tokio::pin!(mint);
+        tokio::select! {
+            _ = &mut mint => panic!("mint finished"),
+            _ = started.notified() => {}
+        }
+        let Credential::ClientCredentials { cached, .. } = &credential else {
+            unreachable!()
+        };
+        assert!(
+            cached.try_read().is_ok(),
+            "network call held the cache write lock"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_token_mint_expires_and_releases_the_refresh_lock() {
+        let credential = Credential::ClientCredentials {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            cached: tokio::sync::RwLock::new(None),
+            mint_lock: tokio::sync::Mutex::new(()),
+        };
+        let start = tokio::time::Instant::now();
+        assert!(
+            credential
+                .token_with_mint(|_, _| std::future::pending())
+                .await
+                .is_err()
+        );
+        assert_eq!(start.elapsed(), LINEAR_HTTP_TIMEOUT);
+        assert_eq!(
+            credential
+                .token_with_mint(|_, _| async { Ok(("fresh".into(), Duration::from_secs(3600))) })
+                .await
+                .unwrap(),
+            "fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompted_dispatch_uses_activity_author_and_their_pairing_record() {
+        let (_temp, paths) = crate::config::test_paths();
+        let (state, mut jobs) = webhook_state(&paths);
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        payload["action"] = json!("prompted");
+        payload["agentActivity"] =
+            json!({"id": "activity-2", "userId": "usr_2", "content": {"body": "follow up"}});
+        let (headers, body) = signed_payload(payload);
+        webhook(State(state.clone()), headers, body).await;
+        let job = tokio::time::timeout(Duration::from_secs(2), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.user_id, "usr_2");
+        let pairing = crate::runtime::lock(&state.rt.pairing);
+        assert!(pairing.is_approved("linear", "usr_2"));
+        assert!(!pairing.is_approved("linear", "usr_1"));
+    }
+
+    #[tokio::test]
+    async fn replay_claim_survives_channel_reconstruction() {
+        let (_temp, paths) = crate::config::test_paths();
+        let (state, mut jobs) = webhook_state(&paths);
+        let (headers, body) = signed_payload(serde_json::from_str(CREATED).unwrap());
+        webhook(State(state), headers.clone(), body.clone()).await;
+        tokio::time::timeout(Duration::from_secs(2), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (restarted, mut jobs) = webhook_state(&paths);
+        webhook(State(restarted.clone()), headers, body).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), jobs.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_claims_expire_and_the_ledger_refuses_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemStateStore::new(root.path().to_path_buf());
+        assert!(claim_dispatch(&store, "first", 100).await.unwrap());
+        assert!(!claim_dispatch(&store, "first", 101).await.unwrap());
+        assert!(claim_dispatch(&store, "next", 281).await.unwrap());
+        let bytes = store
+            .get_record(DISPATCH_CLAIMS_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let claims: BTreeMap<String, u64> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert!(!claims.contains_key("first"));
+        let full: BTreeMap<String, u64> = (0..MAX_DISPATCH_CLAIMS)
+            .map(|i| (i.to_string(), 500))
+            .collect();
+        store
+            .put_record(DISPATCH_CLAIMS_KEY, &serde_json::to_vec(&full).unwrap())
+            .await
+            .unwrap();
+        assert!(claim_dispatch(&store, "overflow", 300).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn prompted_without_activity_id_does_not_dispatch() {
+        let (_temp, paths) = crate::config::test_paths();
+        let (state, mut jobs) = webhook_state(&paths);
+        let (headers, body) = signed_payload(serde_json::from_str(PROMPTED).unwrap());
+        assert_eq!(
+            webhook(State(state.clone()), headers, body).await,
+            StatusCode::OK
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), jobs.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_delivery_still_waiting_for_its_dispatch_claim() {
+        struct BlockFirstRead {
+            inner: Arc<dyn StateStore>,
+            first: std::sync::atomic::AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl StateStore for BlockFirstRead {
+            async fn get_record(&self, key: &str) -> Result<Option<Vec<u8>>> {
+                if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.get_record(key).await
+            }
+            async fn put_record(&self, key: &str, bytes: &[u8]) -> Result<()> {
+                self.inner.put_record(key, bytes).await
+            }
+            async fn compare_exchange_record(
+                &self,
+                key: &str,
+                expected: Option<&[u8]>,
+                bytes: &[u8],
+            ) -> Result<bool> {
+                self.inner
+                    .compare_exchange_record(key, expected, bytes)
+                    .await
+            }
+            async fn delete_record(&self, key: &str) -> Result<()> {
+                self.inner.delete_record(key).await
+            }
+            async fn pull(&self, key: &str, dest: &std::path::Path) -> Result<bool> {
+                self.inner.pull(key, dest).await
+            }
+            async fn push(&self, src: &std::path::Path, key: &str) -> Result<()> {
+                self.inner.push(src, key).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.inner.delete(key).await
+            }
+        }
+        let (_temp, paths) = crate::config::test_paths();
+        let (mut state, mut jobs) = webhook_state(&paths);
+        let store = Arc::new(BlockFirstRead {
+            inner: state.store.clone(),
+            first: std::sync::atomic::AtomicBool::new(true),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        state.store = store.clone();
+        let (headers, body) = signed_payload(serde_json::from_str(CREATED).unwrap());
+        let original = tokio::spawn(webhook(State(state.clone()), headers, body));
+        store.entered.notified().await;
+        let mut stop: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        stop["action"] = json!("prompted");
+        stop["agentActivity"] = json!({"id": "stop-race", "userId": "usr_2", "signal": "stop"});
+        let (headers, body) = signed_payload(stop);
+        assert_eq!(
+            webhook(State(state.clone()), headers, body).await,
+            StatusCode::OK
+        );
+        store.release.notify_one();
+        assert_eq!(original.await.unwrap(), StatusCode::OK);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), jobs.recv())
+                .await
+                .is_err()
+        );
+    }
+
     fn sign(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
@@ -831,6 +1455,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
+    }
+
+    #[test]
+    fn a_signed_body_without_timestamp_is_rejected() {
+        let body = b"{}";
+        let signature = sign("shh", body);
+        assert!(verify_signature("shh", body, Some(&signature), None, SystemTime::now()).is_err());
     }
 
     #[test]
@@ -933,8 +1564,43 @@ mod tests {
         "id": "sess_1",
         "issue": { "id": "iss_abc", "identifier": "DAT-633" }
       },
-      "agentActivity": { "content": { "type": "prompt", "body": "and what about the estimate?" } }
+      "agentActivity": { "userId": "usr_2", "content": { "type": "prompt", "body": "and what about the estimate?" } }
     }"#;
+
+    #[test]
+    fn prompted_uses_activity_author_instead_of_session_creator() {
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        payload["action"] = json!("prompted");
+        payload["agentActivity"] = json!({
+            "userId": "usr_2",
+            "user": { "id": "usr_2", "email": "second@example.com", "name": "Second" },
+            "content": { "body": "follow up" }
+        });
+        let event: AgentSessionEvent = serde_json::from_value(payload).unwrap();
+        let invocation = event.to_invocation().unwrap();
+        assert_eq!(invocation.user_id, "usr_2");
+        assert_eq!(invocation.user_email.as_deref(), Some("second@example.com"));
+        assert_eq!(invocation.user_name.as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn prompted_without_identifiable_principal_is_refused() {
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        payload["action"] = json!("prompted");
+        for activity in [json!({}), json!({"userId": ""}), json!({"userId": "   "})] {
+            payload["agentActivity"] = activity;
+            let event: AgentSessionEvent = serde_json::from_value(payload.clone()).unwrap();
+            assert!(event.to_invocation().is_none());
+        }
+    }
+
+    #[test]
+    fn created_without_comment_author_is_refused() {
+        let mut payload: serde_json::Value = serde_json::from_str(CREATED).unwrap();
+        payload["agentSession"]["comment"]["user"] = serde_json::Value::Null;
+        let event: AgentSessionEvent = serde_json::from_value(payload).unwrap();
+        assert!(event.to_invocation().is_none());
+    }
 
     #[test]
     fn a_created_event_becomes_an_invocation() {
@@ -1006,7 +1672,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_static_credential_is_returned_as_is() {
-        let http = reqwest::Client::new();
+        let http = linear_http_client_builder().no_proxy().build().unwrap();
         let cred = Credential::Static("lin_static".into());
         assert_eq!(cred.token(&http).await.unwrap(), "lin_static");
         // Repeated reads must not drift; a static token has nothing to renew.
@@ -1015,12 +1681,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_token_is_reused_until_its_renewal_deadline() {
-        let http = reqwest::Client::new();
+        let http = linear_http_client_builder().no_proxy().build().unwrap();
         let cred = Credential::ClientCredentials {
             // Deliberately unusable: if the cache is honoured these are never
             // exercised, so a network call here would fail the test.
             client_id: "unused".into(),
             client_secret: "unused".into(),
+            mint_lock: tokio::sync::Mutex::new(()),
             cached: tokio::sync::RwLock::new(Some(CachedToken {
                 token: "cached".into(),
                 renew_after: Instant::now() + Duration::from_secs(600),
@@ -1031,10 +1698,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_cache_entry_is_not_served() {
-        let http = reqwest::Client::new();
+        let http = linear_http_client_builder().no_proxy().build().unwrap();
         let cred = Credential::ClientCredentials {
             client_id: "bogus".into(),
             client_secret: "bogus".into(),
+            mint_lock: tokio::sync::Mutex::new(()),
             cached: tokio::sync::RwLock::new(Some(CachedToken {
                 token: "stale".into(),
                 renew_after: Instant::now() - Duration::from_secs(1),
@@ -1082,7 +1750,7 @@ mod tests {
         let client_secret =
             std::env::var("CICA_LINEAR_CLIENT_SECRET").expect("CICA_LINEAR_CLIENT_SECRET");
 
-        let http = reqwest::Client::new();
+        let http = linear_http_client_builder().no_proxy().build().unwrap();
         let (token, expires_in) = mint_app_token(&http, &client_id, &client_secret)
             .await
             .expect("minting an app token");

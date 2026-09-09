@@ -72,7 +72,7 @@ impl PairingStore {
             .with_context(|| format!("Failed to parse pairing file: {:?}", path))?;
         for ids in store.approved.values_mut() {
             let mut seen = HashSet::new();
-            ids.retain(|id| seen.insert(id.clone()));
+            ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
         }
         store.path = path;
 
@@ -124,6 +124,9 @@ impl PairingStore {
 
     /// Check if a user is approved for a channel
     pub fn is_approved(&self, channel: &str, user_id: &str) -> bool {
+        if user_id.trim().is_empty() {
+            return false;
+        }
         self.approved
             .get(channel)
             .map(|ids| ids.contains(&user_id.to_string()))
@@ -139,6 +142,7 @@ impl PairingStore {
         username: Option<String>,
         display_name: Option<String>,
     ) -> Result<(String, bool)> {
+        anyhow::ensure!(!user_id.trim().is_empty(), "empty pairing user id");
         self.prune_expired();
 
         if let Some(existing) = self
@@ -185,6 +189,10 @@ impl PairingStore {
             .position(|r| r.code == code_upper)
             .ok_or_else(|| anyhow!("No pending request found for code: {}", code))?;
 
+        anyhow::ensure!(
+            !self.pending[idx].user_id.trim().is_empty(),
+            "empty pairing user id"
+        );
         let request = self.pending.remove(idx);
 
         let ids = self.approved.entry(request.channel.clone()).or_default();
@@ -220,6 +228,7 @@ impl PairingStore {
         username: Option<String>,
         _display_name: Option<String>,
     ) -> Result<()> {
+        anyhow::ensure!(!user_id.trim().is_empty(), "empty pairing user id");
         let ids = self.approved.entry(channel.to_string()).or_default();
         if ids.iter().any(|id| id == user_id) {
             return Ok(());
@@ -342,6 +351,30 @@ mod tests {
         assert!(!first.is_approved("telegram", "1"));
         first.reload().unwrap();
         assert!(first.is_approved("telegram", "1"));
+    }
+
+    #[test]
+    fn empty_user_id_is_never_approved_or_matched() {
+        let mut store = PairingStore::default();
+        for id in ["", "   "] {
+            assert!(store.auto_approve("linear", id, None, None).is_err());
+            assert!(
+                store
+                    .get_or_create_pending("linear", id, None, None)
+                    .is_err()
+            );
+            store.approved.insert("linear".into(), vec![id.into()]);
+            assert!(!store.is_approved("linear", id));
+            store.pending.push(PendingRequest {
+                code: "INVALID".into(),
+                channel: "linear".into(),
+                user_id: id.into(),
+                username: None,
+                display_name: None,
+                created_at: now_timestamp(),
+            });
+            assert!(store.approve("INVALID").is_err());
+        }
     }
 
     #[test]

@@ -93,27 +93,35 @@ impl<P: SandboxProvider> WarmHydratingProvider<P> {
     /// Best-effort throughout. The turn has already failed; failing to file the
     /// evidence must not make that worse.
     pub async fn preserve_abandoned(&self, job: &TurnJob, turn_id: &str) {
-        let (artifacts, home): (&dyn SessionArtifacts, &Path) = match job.backend {
-            AiBackend::Claude => (&ClaudeSessionArtifacts, &self.claude_home),
-            AiBackend::Cursor => (&CursorSessionArtifacts, &self.cursor_home),
+        let backend = job.backend;
+        let home = match backend {
+            AiBackend::Claude => self.claude_home.clone(),
+            AiBackend::Cursor => self.cursor_home.clone(),
         };
-
-        // A resumed turn knows its session. A fresh one never reported an id,
-        // so fall back to whatever was written last.
-        let session = match job.resume_session.clone() {
-            Some(session) => Some(session),
-            None => artifacts.latest_session(home),
-        };
-        let Some(session) = session else {
-            warn!("turn {turn_id} abandoned with no session to preserve");
-            return;
-        };
-
-        let staging = self.staging();
-        match artifacts.capture(home, &session, &staging) {
-            Ok(true) => {
+        let resume = job.resume_session.clone();
+        let scratch = self.staging();
+        let captured = tokio::task::spawn_blocking(move || -> Result<_> {
+            let artifacts: &dyn SessionArtifacts = match backend {
+                AiBackend::Claude => &ClaudeSessionArtifacts,
+                AiBackend::Cursor => &CursorSessionArtifacts,
+            };
+            // A resumed turn knows its session. A fresh one never reported an id,
+            // so fall back to whatever was written last.
+            let Some(session) = resume.or_else(|| artifacts.latest_session(&home)) else {
+                return Ok(None);
+            };
+            let staging = crate::atomic::Staging::beside(&scratch)?;
+            if artifacts.capture(&home, &session, staging.path())? {
+                Ok(Some((session, staging)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+        match captured {
+            Ok(Ok(Some((session, staging)))) => {
                 let key = format!("abandoned/{turn_id}");
-                match self.store.push(&staging, &key).await {
+                match self.store.push_archive(staging.path(), &key).await {
                     Ok(()) => warn!(
                         "turn {turn_id} abandoned; partial transcript for session {session} preserved at {key}"
                     ),
@@ -122,10 +130,10 @@ impl<P: SandboxProvider> WarmHydratingProvider<P> {
                     }
                 }
             }
-            Ok(false) => warn!("turn {turn_id} abandoned; session {session} left no transcript"),
-            Err(error) => warn!("failed to capture the abandoned turn {turn_id}: {error}"),
+            Ok(Ok(None)) => warn!("turn {turn_id} abandoned with no transcript to preserve"),
+            Ok(Err(error)) => warn!("failed to capture the abandoned turn {turn_id}: {error}"),
+            Err(error) => warn!("abandoned transcript capture task failed for {turn_id}: {error}"),
         }
-        let _ = std::fs::remove_dir_all(&staging);
     }
 
     pub async fn warm_up(&self) {

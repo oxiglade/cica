@@ -27,6 +27,15 @@ pub trait StateStore: Send + Sync {
     async fn get_record(&self, key: &str) -> Result<Option<Vec<u8>>>;
     /// Unconditionally replace one small record.
     async fn put_record(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    /// Atomically replace a record only if its bytes still match `expected`.
+    async fn compare_exchange_record(
+        &self,
+        _key: &str,
+        _expected: Option<&[u8]>,
+        _bytes: &[u8],
+    ) -> Result<bool> {
+        bail!("state store does not support conditional records")
+    }
     /// Delete one small record; absence is successful.
     async fn delete_record(&self, key: &str) -> Result<()>;
     /// Replace `dest` with the tree stored under `key`, as a whole. On error, or when
@@ -36,6 +45,11 @@ pub trait StateStore: Send + Sync {
     /// contents stay readable. An empty `src` stores an empty tree, which reads back
     /// as present and empty, not absent.
     async fn push(&self, src: &Path, key: &str) -> Result<()>;
+    /// Diagnostic copies may finish in the background after cancellation.
+    /// Canonical state must continue to use `push`.
+    async fn push_archive(&self, src: &Path, key: &str) -> Result<()> {
+        self.push(src, key).await
+    }
     /// Remove `key` and everything under it. An absent key is not an error.
     #[allow(dead_code)]
     async fn delete(&self, key: &str) -> Result<()>;
@@ -80,6 +94,33 @@ pub(crate) mod contract {
         let mut out = BTreeMap::new();
         collect(root, root, &mut out);
         out
+    }
+
+    pub async fn conditional_record_rejects_stale_writers(
+        store: &dyn StateStore,
+        key: &str,
+    ) -> Result<()> {
+        assert!(store.compare_exchange_record(key, None, b"first").await?);
+        assert!(
+            !store
+                .compare_exchange_record(key, None, b"duplicate")
+                .await?
+        );
+        assert!(
+            !store
+                .compare_exchange_record(key, Some(b"wrong"), b"lost")
+                .await?
+        );
+        assert!(
+            store
+                .compare_exchange_record(key, Some(b"first"), b"second")
+                .await?
+        );
+        assert_eq!(
+            store.get_record(key).await?.as_deref(),
+            Some(b"second".as_slice())
+        );
+        Ok(())
     }
 
     pub async fn push_then_pull_round_trips(store: &dyn StateStore, key: &str) -> Result<()> {

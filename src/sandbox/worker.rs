@@ -37,6 +37,8 @@ fn produced_key(turn_id: &str) -> String {
     format!("turns/{turn_id}/out")
 }
 
+const PRESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 const MAX_PRODUCED_BYTES: u64 = 100 * 1024 * 1024;
 
 fn scratch_dir(turn_id: &str, kind: &str) -> std::path::PathBuf {
@@ -708,6 +710,11 @@ impl SandboxProvider for LaunchedWorkerProvider {
         let _guard = lock.lock().await;
         let owner = self.ensure_worker(&job.affinity).await?;
         let turn_id = Uuid::new_v4().to_string();
+        let mut cancel = CancelGuard {
+            store: self.store.clone(),
+            turn_id: turn_id.clone(),
+            armed: true,
+        };
         push_attachments(self.store.as_ref(), &self.base, &job).await;
         self.store
             .put_record(&job_key(&turn_id), &serde_json::to_vec(&job)?)
@@ -721,11 +728,6 @@ impl SandboxProvider for LaunchedWorkerProvider {
         self.store
             .put_record(&Self::inbox_key(&affinity_id), &serde_json::to_vec(&inbox)?)
             .await?;
-        let mut cancel = CancelGuard {
-            store: self.store.clone(),
-            turn_id: turn_id.clone(),
-            armed: true,
-        };
         let deadline = Instant::now() + self.timing.turn_timeout + Duration::from_secs(60);
         let mut liveness = Instant::now() + self.timing.liveness_check;
         let envelope = loop {
@@ -963,21 +965,25 @@ pub async fn run_worker_loop<P: SandboxProvider>(
             }
         }
         let turn_id = inbox.turn_id.clone();
-        let run = engine.run_turn(job.clone());
-        tokio::pin!(run);
-        let timeout = sleep(timing.turn_timeout);
-        tokio::pin!(timeout);
-        // `abandoned` is set instead of calling abandon() inside the arm: the
-        // partial transcript has to be captured *before* it is discarded, and
-        // that is an async push.
-        let mut abandoned = false;
-        let outcome = tokio::select! {
-            result = &mut run => Some(turn_outcome(store.as_ref(), &turn_id, result).await),
-            _ = &mut timeout => { abandoned = true; Some(TurnOutcome::Error("turn timed out".into())) },
-            _ = watch_abort(store.as_ref(), &spec.session, &turn_id, &spec.worker_id, timing.inbox_poll) => { abandoned = true; None },
+        let (outcome, abandoned) = {
+            let run = engine.run_turn(job.clone());
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => (Some(turn_outcome(store.as_ref(), &turn_id, result).await), false),
+                _ = sleep(timing.turn_timeout) => (Some(TurnOutcome::Error("turn timed out".into())), true),
+                _ = watch_abort(store.as_ref(), &spec.session, &turn_id, &spec.worker_id, timing.inbox_poll) => (None, true),
+            }
         };
         if abandoned {
-            engine.preserve_abandoned(&job, &turn_id).await;
+            if tokio::time::timeout(
+                PRESERVATION_TIMEOUT,
+                engine.preserve_abandoned(&job, &turn_id),
+            )
+            .await
+            .is_err()
+            {
+                warn!(%turn_id, "Abandoned transcript preservation timed out");
+            }
             engine.abandon(&job);
         }
         let timed_out =
@@ -1847,6 +1853,135 @@ mod warm_protocol_tests {
     use crate::sandbox::state::FilesystemStateStore;
     use crate::sandbox::warm::WarmHydratingProvider;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct PreservationProbe {
+        inner: FilesystemStateStore,
+        dropped: Arc<AtomicBool>,
+        observed: tokio::sync::mpsc::UnboundedSender<(bool, PathBuf)>,
+        stall: bool,
+    }
+
+    #[async_trait]
+    impl StateStore for PreservationProbe {
+        async fn get_record(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_record(key).await
+        }
+        async fn put_record(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_record(key, bytes).await
+        }
+        async fn delete_record(&self, key: &str) -> Result<()> {
+            self.inner.delete_record(key).await
+        }
+        async fn pull(&self, key: &str, dest: &Path) -> Result<bool> {
+            self.inner.pull(key, dest).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn push(&self, src: &Path, key: &str) -> Result<()> {
+            if key.starts_with("abandoned/") {
+                self.observed
+                    .send((self.dropped.load(Ordering::SeqCst), src.to_path_buf()))
+                    .unwrap();
+                if self.stall {
+                    std::future::pending::<()>().await;
+                }
+            }
+            self.inner.push(src, key).await
+        }
+    }
+
+    struct AgentDropGuard(Arc<AtomicBool>);
+    impl Drop for AgentDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct GuardedAgent(Arc<AtomicBool>);
+    #[async_trait]
+    impl SandboxProvider for GuardedAgent {
+        async fn run_turn(&self, _job: TurnJob) -> Result<TurnResult> {
+            let _guard = AgentDropGuard(self.0.clone());
+            std::future::pending().await
+        }
+    }
+
+    async fn probe_preservation(stall: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (observed, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(PreservationProbe {
+            inner: FilesystemStateStore::new(root.path().join("store")),
+            dropped: dropped.clone(),
+            observed,
+            stall,
+        });
+        let transcript = root
+            .path()
+            .join("claude/.claude/projects/-work/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "partial").unwrap();
+        let seed = root.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("transcript.jsonl"), "partial").unwrap();
+        store.push(&seed, "session/session").await.unwrap();
+        let mut worker_timing = timing();
+        worker_timing.turn_timeout = Duration::from_millis(50);
+        let (task, affinity, worker) = spawn_loop(
+            root.path(),
+            store.clone(),
+            GuardedAgent(dropped),
+            worker_timing,
+        )
+        .await;
+        let mut turn = job();
+        turn.resume_session = Some("session".into());
+        turn.session_persistence = crate::sandbox::SessionPersistence::Resume;
+        assign(store.as_ref(), &affinity, &worker, "probe").await;
+        store
+            .put_record(&job_key("probe"), &serde_json::to_vec(&turn).unwrap())
+            .await
+            .unwrap();
+        let (dropped_before_push, scratch) =
+            tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        if stall {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(31)).await;
+        }
+        let finished = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(finished.is_ok(), "preservation exceeded its deadline");
+        finished.unwrap().unwrap().unwrap();
+        assert!(
+            dropped_before_push,
+            "agent guard was still alive when archive push began"
+        );
+        assert!(!scratch.exists(), "preservation scratch survived");
+        assert!(
+            !transcript.exists(),
+            "abandonment did not discard the local transcript"
+        );
+        assert!(
+            store
+                .get_record(&result_key("probe"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_drops_agent_future_before_archive_push_begins() {
+        probe_preservation(false).await;
+    }
+
+    #[tokio::test]
+    async fn preservation_deadline_still_abandons_and_cleans_scratch() {
+        probe_preservation(true).await;
+    }
 
     struct CountingStore {
         inner: FilesystemStateStore,

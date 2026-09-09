@@ -157,63 +157,96 @@ pub enum ClaudeCode {
     Script(PathBuf),
 }
 
-/// Whether the kernel could actually `exec` this file.
-///
-/// `@anthropic-ai/claude-code` publishes `bin/claude.exe` as a shim that prints
-/// "claude native binary not installed". The real executable arrives in a
-/// per-platform optional dependency, and the package's postinstall is what
-/// repoints `node_modules/.bin/claude` at it. When that postinstall does not run
-/// -- npm with `--ignore-scripts`, a restricted CI, some bun installs -- the link
-/// is left aimed at the shim.
-///
-/// Existence is therefore not enough. Crucially the shim has **no shebang**, so
-/// exec'ing it fails with `Exec format error (os error 8)` at the moment a user
-/// is waiting for an answer. That is the real discriminator, and it is not
-/// "binary vs text": npm routinely puts legitimate shell wrappers in `.bin/`.
-///
-/// So: a compiled binary (NUL bytes in the first block, covering ELF and Mach-O)
-/// or anything starting `#!`.
-fn is_runnable_entry(path: &Path) -> bool {
+/// Classify executable entries, rejecting npm's text stub and foreign binaries.
+fn runnable_entry(path: &Path, os: &str) -> Option<ClaudeCode> {
     use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 1024];
-    let Ok(read) = file.read(&mut head) else {
-        return false;
-    };
+    let read = file.read(&mut head).ok()?;
     let head = &head[..read];
-    head.starts_with(b"#!") || head.contains(&0)
+    if head.starts_with(b"#!") {
+        let line = String::from_utf8_lossy(head.split(|byte| *byte == b'\n').next()?);
+        let javascript = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|target| {
+                target
+                    .extension()
+                    .map(|ext| matches!(ext.to_str(), Some("js" | "mjs" | "cjs")))
+            })
+            .unwrap_or(false)
+            || line.split_whitespace().any(|word| {
+                matches!(
+                    Path::new(word).file_name().and_then(|name| name.to_str()),
+                    Some("node" | "nodejs" | "bun")
+                )
+            });
+        return Some(if javascript {
+            ClaudeCode::Script(path.to_path_buf())
+        } else {
+            ClaudeCode::Native(path.to_path_buf())
+        });
+    }
+    let native = match os {
+        "linux" => head.starts_with(b"\x7fELF"),
+        "macos" => [
+            b"\xfe\xed\xfa\xce",
+            b"\xce\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xcf",
+            b"\xcf\xfa\xed\xfe",
+            b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca",
+            b"\xca\xfe\xba\xbf",
+            b"\xbf\xba\xfe\xca",
+        ]
+        .iter()
+        .any(|magic| head.starts_with(*magic)),
+        _ => false,
+    };
+    native.then(|| ClaudeCode::Native(path.to_path_buf()))
 }
 
 pub fn find_claude_code(paths: &Paths) -> Option<ClaudeCode> {
+    find_claude_code_for_host(paths, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn find_claude_code_for_host(paths: &Paths, os: &str, arch: &str) -> Option<ClaudeCode> {
     let modules = paths.claude_code_dir.join("node_modules");
 
     // What the installer linked, when it linked the real thing.
-    let native = modules.join(".bin/claude");
-    if is_runnable_entry(&native) {
-        return Some(ClaudeCode::Native(native));
+    if let Some(entry) = runnable_entry(&modules.join(".bin/claude"), os) {
+        return Some(entry);
     }
 
     // Otherwise go to the platform package directly. The link being wrong does
     // not mean the binary is missing -- it is usually sitting right here.
     let scoped = modules.join("@anthropic-ai");
-    if let Ok(entries) = std::fs::read_dir(&scoped) {
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path().join("claude"))
-            .filter(|candidate| is_runnable_entry(candidate))
-            .collect();
-        // Deterministic across runs; read_dir order is not guaranteed.
-        candidates.sort();
-        if let Some(candidate) = candidates.into_iter().next() {
-            return Some(ClaudeCode::Native(candidate));
+    let platform = match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        _ => None,
+    };
+    if let Some(platform) = platform {
+        let suffix = if os == "linux" && cfg!(target_env = "musl") {
+            "-musl"
+        } else {
+            ""
+        };
+        let candidate = scoped.join(format!("claude-code-{platform}{suffix}/claude"));
+        if let Some(entry) = runnable_entry(&candidate, os) {
+            return Some(entry);
         }
     }
 
     // Legacy layout: a JavaScript entry point run under bun (<= 2.1.112).
     let script = scoped.join("claude-code/cli.js");
-    if script.exists() {
+    if script.is_file() {
         return Some(ClaudeCode::Script(script));
     }
 
@@ -772,10 +805,58 @@ pub fn ensure_skill_deps(bun: &Path, skill_dir: &Path) {
 #[cfg(test)]
 mod claude_code_entry_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn linux_host_selects_linux_binary_when_both_platform_packages_are_present() {
+        let (_temp, paths) = paths_with(&[]);
+        let modules = paths.claude_code_dir.join("node_modules/@anthropic-ai");
+        let linux = modules.join("claude-code-linux-x64/claude");
+        write_file(&linux, b"\x7fELF\x02\x01\x01\0linux");
+        write_file(
+            &modules.join("claude-code-darwin-arm64/claude"),
+            b"\xcf\xfa\xed\xfe\0darwin",
+        );
+        assert_eq!(
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
+            Some(ClaudeCode::Native(linux))
+        );
+    }
+
+    #[test]
+    fn bin_claude_symlink_to_node_shebang_is_classified_as_script() {
+        let (_temp, paths) = paths_with(&[]);
+        let modules = paths.claude_code_dir.join("node_modules");
+        let script = modules.join("@anthropic-ai/claude-code/cli.js");
+        let link = modules.join(".bin/claude");
+        write_file(&script, b"#!/usr/bin/env node\nconsole.log('hi');");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+        assert_eq!(
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
+            Some(ClaudeCode::Script(link))
+        );
+    }
+
+    #[test]
+    fn foreign_magic_and_non_executable_files_are_refused() {
+        let (_temp, paths) = paths_with(&[]);
+        let candidate = paths
+            .claude_code_dir
+            .join("node_modules/@anthropic-ai/claude-code-linux-x64/claude");
+        for bytes in [b"random\0data".as_slice(), b"\xcf\xfa\xed\xfe\0darwin"] {
+            write_file(&candidate, bytes);
+            assert!(find_claude_code_for_host(&paths, "linux", "x86_64").is_none());
+        }
+        write_file(&candidate, b"\x7fELF\0linux");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(find_claude_code_for_host(&paths, "linux", "x86_64").is_none());
+    }
 
     fn write_file(path: &std::path::Path, bytes: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
         std::fs::write(path, bytes).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn paths_with(files: &[&str]) -> (tempfile::TempDir, Paths) {
@@ -784,7 +865,7 @@ mod claude_code_entry_tests {
         for rel in files {
             let p = paths.claude_code_dir.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).expect("mkdir");
-            std::fs::write(&p, b"#!/bin/sh\n").expect("write");
+            write_file(&p, b"#!/bin/sh\n");
         }
         (tmp, paths)
     }
@@ -814,7 +895,7 @@ mod claude_code_entry_tests {
         );
 
         assert_eq!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Native(
                 modules.join("@anthropic-ai/claude-code-linux-x64/claude")
             )),
@@ -833,7 +914,7 @@ mod claude_code_entry_tests {
             b"\x7fELF\x02\x01\x01\0platform",
         );
         assert_eq!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Native(modules.join(".bin/claude")))
         );
     }
@@ -852,7 +933,7 @@ mod claude_code_entry_tests {
             b"#!/usr/bin/env node\n",
         );
         assert_eq!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Script(
                 modules.join("@anthropic-ai/claude-code/cli.js")
             ))
@@ -863,7 +944,7 @@ mod claude_code_entry_tests {
     fn resolves_the_linked_native_binary() {
         let (_t, paths) = paths_with(&["node_modules/.bin/claude"]);
         assert_eq!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Native(
                 paths.claude_code_dir.join("node_modules/.bin/claude")
             ))
@@ -874,7 +955,7 @@ mod claude_code_entry_tests {
     fn falls_back_to_the_legacy_script() {
         let (_t, paths) = paths_with(&["node_modules/@anthropic-ai/claude-code/cli.js"]);
         assert_eq!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Script(
                 paths
                     .claude_code_dir
@@ -886,13 +967,13 @@ mod claude_code_entry_tests {
     #[test]
     fn never_resolves_the_packages_stub() {
         let (_t, paths) = paths_with(&["node_modules/@anthropic-ai/claude-code/bin/claude.exe"]);
-        assert_eq!(find_claude_code(&paths), None);
+        assert_eq!(find_claude_code_for_host(&paths, "linux", "x86_64"), None);
     }
 
     #[test]
     fn none_when_nothing_is_installed() {
         let (_t, paths) = paths_with(&[]);
-        assert_eq!(find_claude_code(&paths), None);
+        assert_eq!(find_claude_code_for_host(&paths, "linux", "x86_64"), None);
     }
 
     #[test]
@@ -902,7 +983,7 @@ mod claude_code_entry_tests {
             "node_modules/@anthropic-ai/claude-code/cli.js",
         ]);
         assert!(matches!(
-            find_claude_code(&paths),
+            find_claude_code_for_host(&paths, "linux", "x86_64"),
             Some(ClaudeCode::Native(_))
         ));
     }

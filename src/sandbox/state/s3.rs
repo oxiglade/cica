@@ -129,6 +129,62 @@ impl StateStore for S3StateStore {
         Ok(())
     }
 
+    async fn compare_exchange_record(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let client = self.client().await?;
+        let key = object_key(&self.prefix, key, "");
+        let current = client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .send()
+            .await;
+        let etag = match current {
+            Ok(response) => {
+                let etag = response
+                    .e_tag()
+                    .context("s3 conditional record missing ETag")?
+                    .to_string();
+                let current = response.body.collect().await?.into_bytes();
+                if Some(current.as_ref()) != expected {
+                    return Ok(false);
+                }
+                Some(etag)
+            }
+            Err(error) if error.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                if expected.is_some() {
+                    return Ok(false);
+                }
+                None
+            }
+            Err(error) => return Err(error).context("s3 read conditional record"),
+        };
+        let mut request = client
+            .put_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .body(ByteStream::from(bytes.to_vec()));
+        request = match etag {
+            Some(etag) => request.if_match(etag),
+            None => request.if_none_match("*"),
+        };
+        match request.send().await {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("s3 write conditional record"),
+        }
+    }
+
     async fn delete_record(&self, key: &str) -> Result<()> {
         self.client()
             .await?
@@ -682,6 +738,10 @@ mod it_tests {
     );
     contract_test!(delete_makes_key_absent, delete_makes_key_absent);
     contract_test!(delete_absent_key_is_ok, delete_absent_key_is_ok);
+    contract_test!(
+        conditional_record_rejects_stale_writers,
+        conditional_record_rejects_stale_writers
+    );
     contract_test!(record_round_trip, record_round_trip);
     contract_test!(record_absent_is_none, record_absent_is_none);
     contract_test!(record_overwrite_replaces, record_overwrite_replaces);

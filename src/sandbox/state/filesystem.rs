@@ -36,6 +36,33 @@ impl StateStore for FilesystemStateStore {
         Ok(())
     }
 
+    async fn compare_exchange_record(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let path = safe_join(&self.root, key)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let lock_path = path.with_extension("lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let current = self.get_record(key).await?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        crate::atomic::write(&path, bytes)?;
+        Ok(true)
+    }
+
     async fn delete_record(&self, key: &str) -> Result<()> {
         match fs::remove_file(safe_join(&self.root, key)?) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -56,10 +83,13 @@ impl StateStore for FilesystemStateStore {
 
     async fn push(&self, src: &Path, key: &str) -> Result<()> {
         let dst = safe_join(&self.root, key)?;
-        let staging = Staging::beside(&dst)?;
-        copy_dir_all(src, staging.path())?;
-        staging.commit()?;
-        Ok(())
+        push_tree(src, &dst)
+    }
+
+    async fn push_archive(&self, src: &Path, key: &str) -> Result<()> {
+        let src = src.to_path_buf();
+        let dst = safe_join(&self.root, key)?;
+        run_archive_copy(move || push_tree(&src, &dst)).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -71,10 +101,39 @@ impl StateStore for FilesystemStateStore {
     }
 }
 
+fn push_tree(src: &Path, dst: &Path) -> Result<()> {
+    let staging = Staging::beside(dst)?;
+    copy_dir_all(src, staging.path())?;
+    staging.commit()?;
+    Ok(())
+}
+
+async fn run_archive_copy(copy: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+    tokio::task::spawn_blocking(copy).await?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::state::contract;
+
+    #[tokio::test]
+    async fn non_yielding_archive_copy_cannot_block_its_deadline() {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            run_archive_copy(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "synchronous copy prevented the timeout from firing"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+    }
 
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -171,6 +230,29 @@ mod tests {
         assert!(!dest.join("new.txt").exists());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_record_claims_have_exactly_one_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = FilesystemStateStore::new(root.path().to_path_buf());
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store
+                    .compare_exchange_record("claim", None, b"claimed")
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result.unwrap());
+        }
+        assert_eq!(winners, 1);
+    }
+
     macro_rules! record_contract_test {
         ($name:ident) => {
             #[tokio::test]
@@ -184,6 +266,7 @@ mod tests {
         };
     }
 
+    record_contract_test!(conditional_record_rejects_stale_writers);
     record_contract_test!(record_round_trip);
     record_contract_test!(record_absent_is_none);
     record_contract_test!(record_overwrite_replaces);
