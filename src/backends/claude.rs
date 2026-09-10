@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{QueryOptions, QueryResult};
 use crate::config::{ClaudeConfig, Paths};
+use crate::sandbox::ClaudeTarget;
 use crate::setup;
 
 pub const MODELS: &[(&str, &str)] = &[
@@ -55,56 +56,177 @@ fn config_relative_path(paths: &Paths, value: &str) -> std::path::PathBuf {
     }
 }
 
-/// Point Claude Code at the configured provider and give it the credentials
-/// that provider needs.
-///
-/// Lifted out of the command builder so the choice is unit testable without
-/// spawning a process — in particular the removal of Anthropic credentials
-/// under Bedrock, which is what keeps a turn inside the chosen region.
-fn apply_backend_env(cmd: &mut Command, claude: &ClaudeConfig, paths: &Paths) {
-    if claude.use_bedrock {
-        cmd.env("CLAUDE_CODE_USE_BEDROCK", "1");
-        if let Some(region) = claude.bedrock_region.as_deref().filter(|s| !s.is_empty()) {
-            cmd.env("AWS_REGION", region);
-        }
-        // No Anthropic credential is passed, and any inherited one is removed.
-        // Claude Code already prefers Bedrock when both are present, but
-        // stripping them makes "requests never reach the Anthropic API" a
-        // property of this process rather than a behaviour of the CLI that a
-        // future version could change.
-        cmd.env_remove("ANTHROPIC_API_KEY");
-        cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
-        cmd.env_remove("ANTHROPIC_OAUTH_TOKEN");
-        cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-    } else if claude.use_vertex {
-        cmd.env("CLAUDE_CODE_USE_VERTEX", "1");
-        cmd.env(
-            "ANTHROPIC_VERTEX_PROJECT_ID",
-            claude.vertex_project_id.as_deref().unwrap_or(""),
-        );
-        cmd.env(
-            "CLOUD_ML_REGION",
-            claude.vertex_region.as_deref().unwrap_or("europe-west1"),
-        );
-        // Long-lived auth: service account key file (recommended for servers; no gcloud expiry)
-        if let Some(ref cred_path) = claude.vertex_credentials_path {
-            let abs = config_relative_path(paths, cred_path);
-            if abs.exists() {
-                cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
+fn apply_backend_env(
+    cmd: &mut Command,
+    claude: &ClaudeConfig,
+    paths: &Paths,
+    target: &ClaudeTarget,
+) {
+    match target {
+        ClaudeTarget::Bedrock { region } => {
+            cmd.env("CLAUDE_CODE_USE_BEDROCK", "1");
+            if let Some(region) = region {
+                cmd.env("AWS_REGION", region);
+            }
+            for name in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ] {
+                cmd.env_remove(name);
             }
         }
-        // Otherwise Vertex uses gcloud ADC or existing GOOGLE_APPLICATION_CREDENTIALS env
-    } else if let Some(cred) = claude.api_key.as_deref() {
-        match setup::detect_credential_type(cred) {
-            setup::CredentialType::ApiKey => {
-                cmd.env("ANTHROPIC_API_KEY", cred);
+        ClaudeTarget::Vertex { project, region } => {
+            cmd.env("CLAUDE_CODE_USE_VERTEX", "1")
+                .env("ANTHROPIC_VERTEX_PROJECT_ID", project)
+                .env("CLOUD_ML_REGION", region);
+            if let Some(ref cred_path) = claude.vertex_credentials_path {
+                let abs = config_relative_path(paths, cred_path);
+                if abs.exists() {
+                    cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
+                }
             }
-            setup::CredentialType::OAuthToken => {
-                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", cred);
-                cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
+        }
+        ClaudeTarget::Anthropic => {
+            if let Some(cred) = claude.api_key.as_deref() {
+                match setup::detect_credential_type(cred) {
+                    setup::CredentialType::ApiKey => {
+                        cmd.env("ANTHROPIC_API_KEY", cred);
+                    }
+                    setup::CredentialType::OAuthToken => {
+                        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", cred);
+                        cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
+                    }
+                }
             }
         }
     }
+}
+
+fn competing_env(name: &str) -> bool {
+    name.starts_with("ANTHROPIC_")
+        || name.starts_with("VERTEX_REGION_CLAUDE_")
+        || name.starts_with("AWS_ENDPOINT_URL")
+        || matches!(
+            name,
+            "CLAUDE_CODE_USE_BEDROCK"
+                | "CLAUDE_CODE_USE_VERTEX"
+                | "CLAUDE_CODE_USE_FOUNDRY"
+                | "CLAUDE_CODE_USE_ANTHROPIC_AWS"
+                | "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD"
+                | "CLAUDE_CODE_USE_MANTLE"
+                | "CLAUDE_CODE_USE_GATEWAY"
+                | "CLAUDE_CODE_SKIP_BEDROCK_AUTH"
+                | "CLAUDE_CODE_SKIP_VERTEX_AUTH"
+                | "CLAUDE_CODE_SKIP_FOUNDRY_AUTH"
+                | "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH"
+                | "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH"
+                | "CLAUDE_CODE_SKIP_MANTLE_AUTH"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
+                | "CLAUDE_CODE_HOST_AUTH_ENV_VAR"
+                | "CLAUDE_CODE_HOST_CREDS_FILE"
+                | "CLAUDE_CODE_API_BASE_URL"
+                | "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
+                | "CLAUDE_CODE_SUBAGENT_MODEL"
+                | "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
+                | "CLAUDE_CODE_AUTO_MODE_MODEL"
+                | "CLAUDE_CODE_BG_CLASSIFIER_MODEL"
+                | "CLAUDE_CONTEXT_COLLAPSE_MODEL"
+                | "CLAUDE_CODE_EXTRA_BODY"
+                | "CLOUD_ML_REGION"
+                | "AWS_REGION"
+                | "AWS_DEFAULT_REGION"
+        )
+}
+
+fn isolate_backend_env(cmd: &mut Command, target: &ClaudeTarget) {
+    let names = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(cmd.as_std().get_envs().map(|(key, _)| key.to_os_string()))
+        .collect::<Vec<_>>();
+    for name in names {
+        if competing_env(&name.to_string_lossy()) {
+            cmd.env_remove(name);
+        }
+    }
+    if !matches!(target, ClaudeTarget::Bedrock { .. }) {
+        cmd.env_remove("AWS_BEARER_TOKEN_BEDROCK");
+    }
+    if !matches!(target, ClaudeTarget::Vertex { .. }) {
+        cmd.env_remove("GOOGLE_APPLICATION_CREDENTIALS");
+    }
+    // Claude Code must also ignore routing supplied by user/project/managed settings.
+    cmd.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1")
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
+}
+
+async fn reject_model_routing_settings(paths: &Paths) -> Result<()> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.claude_home.join(".claude"));
+    let config_dir = if config_dir.is_absolute() {
+        config_dir
+    } else {
+        paths.base.join(config_dir)
+    };
+    let mut files = vec![
+        config_dir.join("settings.json"),
+        config_dir.join("cowork_settings.json"),
+        paths.base.join(".claude/settings.json"),
+        paths.base.join(".claude/settings.local.json"),
+    ];
+    let base = std::fs::canonicalize(&paths.base)?;
+    if let Some(root) = base.ancestors().find(|dir| dir.join(".git").exists()) {
+        files.push(root.join(".claude/settings.local.json"));
+        // Claude also reads the main worktree's local settings from linked worktrees.
+        let output = Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(&base)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .context("finding Claude's shared local settings")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "could not locate Claude's shared local settings"
+        );
+        let common = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+        let root = if common.file_name().is_some_and(|name| name == ".git") {
+            common
+                .parent()
+                .context("git common directory has no parent")?
+        } else {
+            &common
+        };
+        files.push(root.join(".claude/settings.local.json"));
+    }
+    for file in files {
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
+        };
+        let settings: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", file.display()))?;
+        for name in ["modelOverrides", "fallbackModel"] {
+            if let Some(value) = settings.get(name) {
+                anyhow::ensure!(
+                    value.is_null()
+                        || value.as_object().is_some_and(|v| v.is_empty())
+                        || value.as_array().is_some_and(|v| v.is_empty()),
+                    "{} in {} conflicts with the job-selected model; remove it for distributed turns",
+                    name,
+                    file.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_aws_file_env(
@@ -151,33 +273,29 @@ pub async fn query_with_options(
     prompt: &str,
     options: QueryOptions,
 ) -> Result<QueryResult> {
-    let use_bedrock = claude.use_bedrock;
-    let use_vertex = claude.use_vertex;
-    let bedrock_region = claude.bedrock_region.as_deref().filter(|s| !s.is_empty());
-    let vertex_project_id = claude.vertex_project_id.as_deref();
-    let credential = claude.api_key.as_deref();
-
-    if use_bedrock {
-        if use_vertex {
-            warn!("both use_bedrock and use_vertex are set; using Bedrock");
+    let target = options
+        .claude_target
+        .clone()
+        .unwrap_or_else(|| ClaudeTarget::from_config(claude));
+    let authoritative = options.dispatched && options.claude_target.is_some();
+    if authoritative {
+        target.validate_distributed()?;
+        reject_model_routing_settings(paths).await?;
+    }
+    match &target {
+        ClaudeTarget::Bedrock { region } => debug!(?region, "Using Amazon Bedrock"),
+        ClaudeTarget::Vertex { project, .. } => {
+            anyhow::ensure!(
+                !project.is_empty(),
+                "Vertex AI is enabled but no project ID is set. Run `cica init` to configure Vertex AI."
+            );
+            debug!(project, "Using Vertex AI");
         }
-        // Nothing to validate. AWS credentials come from the provider chain --
-        // an ECS task role, an EC2 instance profile, a shared profile -- none of
-        // which is visible from here, and the region may come from the ambient
-        // AWS environment when `bedrock_region` is unset.
-        match bedrock_region {
-            Some(region) => debug!("Using Amazon Bedrock in {}", region),
-            None => debug!("Using Amazon Bedrock (region from the AWS environment)"),
+        ClaudeTarget::Anthropic => {
+            claude.api_key.as_deref().ok_or_else(|| {
+                anyhow!("No credential configured. Run `cica init` to set up Claude.")
+            })?;
         }
-    } else if use_vertex {
-        let project_id = vertex_project_id
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Vertex AI is enabled but no project ID is set. Run `cica init` to configure Vertex AI."))?;
-        debug!("Using Vertex AI project: {}", project_id);
-    } else {
-        credential.ok_or_else(|| {
-            anyhow!("No credential configured. Run `cica init` to set up Claude.")
-        })?;
     }
 
     let claude_code = setup::find_claude_code(paths)
@@ -200,7 +318,7 @@ pub async fn query_with_options(
     info!("Querying Claude: {}", prompt);
     debug!("Using claude_code: {:?}", claude_code);
 
-    let aws_home = if use_bedrock {
+    let aws_home = if matches!(target, ClaudeTarget::Bedrock { .. }) {
         let home =
             std::env::home_dir().context("Could not determine the original AWS home directory")?;
         let home = std::path::absolute(home)?;
@@ -234,6 +352,8 @@ pub async fn query_with_options(
 
         if let Some(ref model) = options.model {
             cmd.args(["--model", model]);
+        } else if options.dispatched {
+            cmd.args(["--model", "default"]);
         }
 
         cmd.current_dir(&paths.base);
@@ -242,7 +362,10 @@ pub async fn query_with_options(
 
         cmd.arg(prompt);
 
-        apply_backend_env(&mut cmd, claude, paths);
+        if authoritative {
+            isolate_backend_env(&mut cmd, &target);
+        }
+        apply_backend_env(&mut cmd, claude, paths, &target);
         if let Some(home) = &aws_home {
             apply_aws_file_env(&mut cmd, home, |name| std::env::var_os(name));
         }
@@ -354,8 +477,91 @@ mod tests {
             &mut cmd,
             claude,
             &Paths::for_base(std::path::PathBuf::from("/worker")),
+            &crate::sandbox::ClaudeTarget::from_config(claude),
         );
         envs(&cmd)
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_cannot_inherit_a_model_remap_from_the_main_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+            vec!["worktree", "add", "--detach", linked.to_str().unwrap()],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&main)
+                .args(args)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let settings = main.join(".claude/settings.local.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"modelOverrides":{"claude-opus-4-6":"wrong-model"}}"#,
+        )
+        .unwrap();
+        let paths = Paths::for_base(linked);
+        let error = super::reject_model_routing_settings(&paths)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("job-selected model"));
+        std::fs::write(
+            &settings,
+            r#"{"modelOverrides":{},"permissions":{"allow":["Read"]}}"#,
+        )
+        .unwrap();
+        super::reject_model_routing_settings(&paths).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_git_dir_cannot_hide_repository_local_model_remaps() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let metadata = root.path().join("metadata");
+        let output = Command::new("git")
+            .arg("init")
+            .arg("--separate-git-dir")
+            .arg(&metadata)
+            .arg(&main)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let base = main.join("subdirectory");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(main.join(".claude")).unwrap();
+        std::fs::write(
+            main.join(".claude/settings.local.json"),
+            r#"{"fallbackModel":["wrong-model"]}"#,
+        )
+        .unwrap();
+        let error = super::reject_model_routing_settings(&Paths::for_base(base))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("job-selected model"));
     }
 
     #[test]

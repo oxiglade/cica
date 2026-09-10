@@ -1239,6 +1239,7 @@ pub async fn handle_onboarding(
     let options = backends::QueryOptions {
         system_prompt: Some(system_prompt),
         skip_permissions: true,
+        model: rt.config.model_for(rt.config.backend),
         ..Default::default()
     };
 

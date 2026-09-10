@@ -357,6 +357,8 @@ pub enum WorkerPhase {
     Draining,
 }
 
+pub const JOB_ROUTING_VERSION: u32 = 1;
+
 /// Worker-written liveness and current-turn state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HeartbeatRecord {
@@ -366,6 +368,8 @@ pub struct HeartbeatRecord {
     pub last_turn: Option<String>,
     pub protocol_version: u32,
     pub policy_hash: String,
+    #[serde(default)]
+    pub job_routing_version: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -479,10 +483,7 @@ impl LaunchedWorkerProvider {
         let read = || self.read_record::<HeartbeatRecord>(&heartbeat_key);
         let first = read().await?;
         if let Some(heartbeat) = first {
-            if heartbeat.protocol_version != PROTOCOL_VERSION
-                || heartbeat.policy_hash != self.policy_hash
-                || heartbeat.phase == WorkerPhase::Draining
-            {
+            if !self.compatible_heartbeat(&heartbeat) {
                 return Ok(Liveness::Gone);
             }
             let fresh = {
@@ -504,7 +505,9 @@ impl LaunchedWorkerProvider {
             }
             sleep(Duration::from_millis(100)).await;
             return Ok(match read().await? {
-                Some(next) if next.seq != heartbeat.seq => Liveness::Live,
+                Some(next) if self.compatible_heartbeat(&next) && next.seq != heartbeat.seq => {
+                    Liveness::Live
+                }
                 _ => Liveness::Gone,
             });
         }
@@ -515,11 +518,65 @@ impl LaunchedWorkerProvider {
             return Ok(Liveness::Booting);
         }
         sleep(Duration::from_millis(100)).await;
-        Ok(if read().await?.is_some() {
-            Liveness::Live
-        } else {
-            Liveness::Gone
-        })
+        Ok(
+            if read()
+                .await?
+                .is_some_and(|hb| self.compatible_heartbeat(&hb))
+            {
+                Liveness::Live
+            } else {
+                Liveness::Gone
+            },
+        )
+    }
+
+    fn compatible_heartbeat(&self, heartbeat: &HeartbeatRecord) -> bool {
+        heartbeat.protocol_version == PROTOCOL_VERSION
+            && heartbeat.policy_hash == self.policy_hash
+            && heartbeat.job_routing_version == Some(JOB_ROUTING_VERSION)
+            && heartbeat.phase != WorkerPhase::Draining
+    }
+
+    async fn await_routing_capability(&self, id: &str, owner: &OwnerRecord) -> Result<bool> {
+        let deadline = Instant::now() + self.timing.start_timeout;
+        loop {
+            if let Some(heartbeat) = self
+                .read_record::<HeartbeatRecord>(&Self::heartbeat_key(id, &owner.worker_id))
+                .await?
+            {
+                return Ok(self.compatible_heartbeat(&heartbeat));
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(
+                self.timing
+                    .inbox_poll
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
+    }
+
+    async fn confirm_stop(&self, id: &str, owner: &OwnerRecord) -> Result<()> {
+        let handle = match &owner.handle {
+            Some(handle) => Some(handle.clone()),
+            None => {
+                self.launcher
+                    .reconcile(&self.spec(id, owner.worker_id.clone(), owner.launch_token.clone()))
+                    .await?
+            }
+        };
+        if let Some(handle) = handle {
+            anyhow::ensure!(
+                self.launcher
+                    .stop_and_wait(&handle, Duration::from_secs(30))
+                    .await?
+                    != StopOutcome::Unknown,
+                "worker state unknown for session {id}"
+            );
+        }
+        Ok(())
     }
 
     async fn launch_worker(
@@ -566,20 +623,8 @@ impl LaunchedWorkerProvider {
                 || current.policy_hash != self.policy_hash
                 || current.affinity != *affinity
             {
-                if let Some(handle) = &current.handle {
-                    match self
-                        .launcher
-                        .stop_and_wait(handle, Duration::from_secs(30))
-                        .await?
-                    {
-                        StopOutcome::Terminated | StopOutcome::NotFound => owner = None,
-                        StopOutcome::Unknown => {
-                            anyhow::bail!("worker state unknown for session {id}")
-                        }
-                    }
-                } else {
-                    owner = None;
-                }
+                self.confirm_stop(&id, current).await?;
+                owner = None;
             } else if current.phase == OwnerPhase::Launching {
                 let spec = self.spec(&id, current.worker_id.clone(), current.launch_token.clone());
                 if let Some(handle) = self.launcher.reconcile(&spec).await? {
@@ -592,24 +637,18 @@ impl LaunchedWorkerProvider {
             }
         }
         if let Some(current) = &owner {
-            match self.liveness(&id, current).await {
-                Err(_) => anyhow::bail!("worker state unknown for session {id}"),
-                Ok(Liveness::Live | Liveness::Booting) => {}
-                Ok(Liveness::Gone) => {
-                    if let Some(handle) = &current.handle {
-                        match self
-                            .launcher
-                            .stop_and_wait(handle, Duration::from_secs(30))
-                            .await?
-                        {
-                            StopOutcome::Terminated | StopOutcome::NotFound => owner = None,
-                            StopOutcome::Unknown => {
-                                anyhow::bail!("worker state unknown for session {id}")
-                            }
-                        }
-                    } else {
-                        owner = None;
-                    }
+            let live = match self.liveness(&id, current).await? {
+                Liveness::Booting if self.await_routing_capability(&id, current).await? => {
+                    Liveness::Live
+                }
+                Liveness::Booting => Liveness::Gone,
+                other => other,
+            };
+            match live {
+                Liveness::Live => {}
+                Liveness::Gone | Liveness::Booting => {
+                    self.confirm_stop(&id, current).await?;
+                    owner = None;
                 }
             }
         }
@@ -655,7 +694,14 @@ impl LaunchedWorkerProvider {
                 }
             }
             drop(owners);
-            owner = Some(self.launch_worker(affinity, &id).await?);
+            let launched = self.launch_worker(affinity, &id).await?;
+            if !self.await_routing_capability(&id, &launched).await? {
+                self.confirm_stop(&id, &launched).await?;
+                anyhow::bail!(
+                    "launched worker lacks the job routing capability for session {id}; update the worker image"
+                );
+            }
+            owner = Some(launched);
         }
         let owner = owner.unwrap();
         self.owners.lock().await.insert(
@@ -699,6 +745,11 @@ impl Drop for CancelGuard {
 #[async_trait]
 impl SandboxProvider for LaunchedWorkerProvider {
     async fn run_turn(&self, job: TurnJob) -> Result<TurnResult> {
+        if job.backend == crate::config::AiBackend::Claude
+            && let Some(target) = &job.claude_target
+        {
+            target.validate_distributed()?;
+        }
         let affinity_id = job.affinity.id();
         let lock = {
             let mut locks = self.locks.lock().unwrap();
@@ -856,6 +907,7 @@ pub async fn run_worker_loop<P: SandboxProvider>(
         last_turn: None,
         protocol_version: PROTOCOL_VERSION,
         policy_hash: spec.policy_hash.clone(),
+        job_routing_version: Some(JOB_ROUTING_VERSION),
     }));
     put_json(store.as_ref(), &heartbeat_key, &*heartbeat.lock().await).await?;
     engine.warm_up().await;
@@ -1474,6 +1526,7 @@ mod tests {
             skip_permissions: true,
             backend: AiBackend::Claude,
             model: None,
+            claude_target: None,
             attachments: Vec::new(),
         }
     }
@@ -2125,6 +2178,8 @@ mod warm_protocol_tests {
     }
 
     struct RecordingLauncher {
+        heartbeat_store: Option<Arc<dyn StateStore>>,
+        routing_version: Option<u32>,
         starts: Arc<AtomicUsize>,
         stops: Arc<Mutex<Vec<String>>>,
         reconciles: Arc<AtomicUsize>,
@@ -2142,6 +2197,21 @@ mod warm_protocol_tests {
     impl Launcher for RecordingLauncher {
         async fn start(&self, spec: &WorkerSpec) -> Result<Handle> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some(store) = &self.heartbeat_store {
+                let mut value = serde_json::json!({
+                    "seq": 1, "phase": "Ready", "current_turn": null, "last_turn": null,
+                    "protocol_version": 1, "policy_hash": spec.policy_hash,
+                });
+                if let Some(version) = self.routing_version {
+                    value["job_routing_version"] = version.into();
+                }
+                put_json(
+                    store.as_ref(),
+                    &LaunchedWorkerProvider::heartbeat_key(&spec.session, &spec.worker_id),
+                    &value,
+                )
+                .await?;
+            }
             Ok(Handle {
                 kind: LauncherKind::Subprocess,
                 id: spec.worker_id.clone(),
@@ -2166,12 +2236,14 @@ mod warm_protocol_tests {
         }
     }
 
-    fn recording_launcher(outcome: StopOutcome) -> LauncherProbe {
+    fn recording_launcher(store: Arc<dyn StateStore>, outcome: StopOutcome) -> LauncherProbe {
         let starts = Arc::new(AtomicUsize::new(0));
         let stops = Arc::new(Mutex::new(Vec::new()));
         let reconciles = Arc::new(AtomicUsize::new(0));
         (
             RecordingLauncher {
+                heartbeat_store: Some(store),
+                routing_version: Some(JOB_ROUTING_VERSION),
                 starts: starts.clone(),
                 stops: stops.clone(),
                 reconciles: reconciles.clone(),
@@ -2217,6 +2289,7 @@ mod warm_protocol_tests {
                 last_turn: None,
                 protocol_version: PROTOCOL_VERSION,
                 policy_hash: "policy".into(),
+                job_routing_version: Some(JOB_ROUTING_VERSION),
             },
         )
         .await
@@ -2298,6 +2371,7 @@ mod warm_protocol_tests {
             skip_permissions: true,
             backend: AiBackend::Claude,
             model: None,
+            claude_target: None,
             attachments: Vec::new(),
         }
     }
@@ -2313,6 +2387,191 @@ mod warm_protocol_tests {
             turn_timeout: Duration::from_secs(30),
             max_age: Duration::from_secs(300),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_launch_without_a_heartbeat_never_receives_a_job() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FaultStore::default());
+        let (mut launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
+        launcher.heartbeat_store = None;
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().into(),
+            timing(),
+            "policy".into(),
+            2,
+        );
+        assert!(provider.run_turn(job()).await.is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(key, _)| !key.starts_with("turns/") && !key.ends_with("/inbox"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_launch_of_an_old_image_is_stopped_without_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FaultStore::default());
+        let (mut launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
+        launcher.routing_version = None;
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().into(),
+            timing(),
+            "policy".into(),
+            2,
+        );
+        let error = provider.run_turn(job()).await.unwrap_err();
+        assert!(error.to_string().contains("job routing capability"));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(key, _)| !key.starts_with("turns/") && !key.ends_with("/inbox"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incompatible_adopted_worker_is_stopped_before_a_capable_replacement() {
+        for version in [None, Some(0), Some(2)] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(FaultStore::default());
+            let (launcher, starts, stops, _) =
+                recording_launcher(store.clone(), StopOutcome::Terminated);
+            let provider = LaunchedWorkerProvider::new(
+                store.clone(),
+                Box::new(launcher),
+                root.path().into(),
+                timing(),
+                "policy".into(),
+                2,
+            );
+            let affinity = job().affinity;
+            put_json(
+                store.as_ref(),
+                &LaunchedWorkerProvider::owner_key(&affinity.id()),
+                &owner(affinity.clone(), "old"),
+            )
+            .await
+            .unwrap();
+            let mut old = serde_json::json!({"seq": 1, "phase": "Ready", "current_turn": null, "last_turn": null, "protocol_version": 1, "policy_hash": "policy"});
+            if let Some(version) = version {
+                old["job_routing_version"] = version.into();
+            }
+            put_json(
+                store.as_ref(),
+                &LaunchedWorkerProvider::heartbeat_key(&affinity.id(), "old"),
+                &old,
+            )
+            .await
+            .unwrap();
+            let replacement = provider.ensure_worker(&affinity).await.unwrap();
+            assert_ne!(replacement.worker_id, "old");
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert_eq!(&*stops.lock().unwrap(), &["old"]);
+            let hb: HeartbeatRecord = provider
+                .read_record(&LaunchedWorkerProvider::heartbeat_key(
+                    &affinity.id(),
+                    &replacement.worker_id,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hb.job_routing_version, Some(JOB_ROUTING_VERSION));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incompatible_worker_with_unknown_stop_is_never_replaced_or_dispatched() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FaultStore::default());
+        let (launcher, starts, stops, _) = recording_launcher(store.clone(), StopOutcome::Unknown);
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().into(),
+            timing(),
+            "policy".into(),
+            2,
+        );
+        let affinity = job().affinity;
+        put_json(
+            store.as_ref(),
+            &LaunchedWorkerProvider::owner_key(&affinity.id()),
+            &owner(affinity.clone(), "old"),
+        )
+        .await
+        .unwrap();
+        put_json(
+            store.as_ref(),
+            &LaunchedWorkerProvider::heartbeat_key(&affinity.id(), "old"),
+            &serde_json::json!({
+                "seq": 1, "phase": "Ready", "current_turn": null, "last_turn": null,
+                "protocol_version": 1, "policy_hash": "policy"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            provider
+                .run_turn(job())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("worker state unknown")
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(stops.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(key, _)| !key.starts_with("turns/") && !key.ends_with("/inbox"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn regional_destination_is_validated_before_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FaultStore::default());
+        let (launcher, starts, _, _) = recording_launcher(store.clone(), StopOutcome::Terminated);
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().into(),
+            timing(),
+            "policy".into(),
+            2,
+        );
+        let mut turn = job();
+        turn.claude_target = Some(crate::sandbox::ClaudeTarget::Bedrock { region: None });
+        assert!(
+            provider
+                .run_turn(turn)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicit bedrock_region")
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(store.puts.lock().unwrap().is_empty());
     }
 
     async fn assign(store: &dyn StateStore, affinity: &str, worker: &str, turn: &str) {
@@ -2691,7 +2950,8 @@ mod warm_protocol_tests {
     async fn cap_never_evicts_a_busy_worker() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, stops, _) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -2745,7 +3005,8 @@ mod warm_protocol_tests {
     async fn cap_stops_the_lru_idle_worker() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, stops, _) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -2787,7 +3048,7 @@ mod warm_protocol_tests {
     async fn unknown_stop_outcome_fails_the_turn_without_a_second_worker() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, _, _) = recording_launcher(StopOutcome::Unknown);
+        let (launcher, starts, _, _) = recording_launcher(store.clone(), StopOutcome::Unknown);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -2813,7 +3074,8 @@ mod warm_protocol_tests {
     async fn policy_mismatch_replaces_the_worker() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, stops, _) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -2841,7 +3103,8 @@ mod warm_protocol_tests {
     async fn launching_owner_is_reconciled_not_relaunched() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, _, reconciles) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, _, reconciles) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -2879,7 +3142,8 @@ mod warm_protocol_tests {
     async fn stale_heartbeat_replaces_the_worker_after_confirmed_stop() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, stops, _) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
         let provider = LaunchedWorkerProvider::new(
             store.clone(),
             Box::new(launcher),
@@ -3140,7 +3404,7 @@ mod warm_protocol_tests {
     async fn vanished_worker_fails_the_turn_and_never_redispatches() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
-        let (launcher, starts, _, _) = recording_launcher(StopOutcome::Terminated);
+        let (launcher, starts, _, _) = recording_launcher(store.clone(), StopOutcome::Terminated);
         let mut router_timing = timing();
         router_timing.liveness_check = Duration::from_secs(1);
         let provider = Arc::new(LaunchedWorkerProvider::new(

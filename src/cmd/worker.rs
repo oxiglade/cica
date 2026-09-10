@@ -51,7 +51,7 @@ pub async fn run(
 
     if let Some(turn_id) = turn_id {
         let engine = crate::sandbox::hydrating::HydratingProvider::new(
-            LocalProcessProvider::new(config.clone(), paths.clone()),
+            LocalProcessProvider::for_worker(config.clone(), paths.clone()),
             store.clone(),
             paths.claude_home.clone(),
             paths.cursor_home.clone(),
@@ -83,7 +83,7 @@ pub async fn run(
         policy_hash: policy_hash.into(),
     };
     let engine = WarmHydratingProvider::new(
-        LocalProcessProvider::new(config.clone(), paths.clone()),
+        LocalProcessProvider::for_worker(config.clone(), paths.clone()),
         store.clone(),
         paths.claude_home.clone(),
         paths.cursor_home.clone(),

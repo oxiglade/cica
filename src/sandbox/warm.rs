@@ -363,6 +363,7 @@ mod tests {
             skip_permissions: true,
             backend: AiBackend::Claude,
             model: None,
+            claude_target: None,
             attachments: Vec::new(),
         }
     }
