@@ -58,11 +58,6 @@ fn config_relative_path(paths: &Paths, value: &str) -> std::path::PathBuf {
 
 /// Point Claude Code at the target, and report whether cica handed it a
 /// credential for that target.
-///
-/// The answer decides `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` in the caller: the
-/// flag tells Claude Code the host owns authentication, and Claude Code then
-/// stops consulting ambient credential providers. Claiming it while supplying
-/// nothing leaves the turn unable to authenticate at all.
 #[must_use]
 fn apply_backend_env(
     cmd: &mut Command,
@@ -84,17 +79,14 @@ fn apply_backend_env(
             ] {
                 cmd.env_remove(name);
             }
-            // Deliberately none: Bedrock credentials come from the AWS chain --
-            // an instance profile, an ECS task role, a shared profile -- which
-            // is the point of role-based auth. cica never sees them.
+            // Bedrock credentials come from the AWS chain; cica never sees them.
             false
         }
         ClaudeTarget::Vertex { project, region } => {
             cmd.env("CLAUDE_CODE_USE_VERTEX", "1")
                 .env("ANTHROPIC_VERTEX_PROJECT_ID", project)
                 .env("CLOUD_ML_REGION", region);
-            // A service-account file is a credential cica supplies; falling
-            // back to gcloud ADC is the ambient chain, same as Bedrock's.
+            // A service-account file is cica's to supply; gcloud ADC is the ambient chain.
             let mut supplied = false;
             if let Some(ref cred_path) = claude.vertex_credentials_path {
                 let abs = config_relative_path(paths, cred_path);
@@ -177,10 +169,7 @@ fn isolate_backend_env(cmd: &mut Command, target: &ClaudeTarget) {
     if !matches!(target, ClaudeTarget::Vertex { .. }) {
         cmd.env_remove("GOOGLE_APPLICATION_CREDENTIALS");
     }
-    // Claude Code must also ignore endpoints supplied by user/project/managed
-    // settings. The provider/auth half of that lock is
-    // CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, which the caller sets only when we
-    // actually supply a credential -- see apply_backend_env.
+    // Claude Code must also ignore endpoints supplied by user/project/managed settings.
     cmd.env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
 }
 
@@ -388,11 +377,9 @@ pub async fn query_with_options(
             isolate_backend_env(&mut cmd, &target);
         }
         let host_credential = apply_backend_env(&mut cmd, claude, paths, &target);
-        // Only claim the host owns authentication when it does. Claude Code
-        // reads this flag as "credentials come from the host" and stops
-        // consulting ambient providers -- an EC2 instance profile, an ECS task
-        // role, gcloud ADC -- so setting it for a role-based Bedrock or ADC
-        // Vertex deployment leaves the turn with no way to authenticate.
+        // Claude Code reads this flag as "the host supplies credentials" and stops
+        // consulting ambient providers, so claiming it for a role-based Bedrock or
+        // ADC Vertex turn leaves that turn no way to authenticate.
         if authoritative && host_credential {
             cmd.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
         }
@@ -505,9 +492,6 @@ mod tests {
         applied_with_credential(claude, &Paths::for_base("/worker".into())).0
     }
 
-    /// The environment handed to Claude Code, plus whether cica supplied the
-    /// credential for it -- the answer that gates
-    /// CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST.
     fn applied_with_credential(
         claude: &ClaudeConfig,
         paths: &Paths,
@@ -572,7 +556,6 @@ mod tests {
             ..Default::default()
         };
 
-        // gcloud ADC is the ambient chain, the same shape as Bedrock's.
         let (_, adc) = applied_with_credential(&vertex(None), &paths);
         assert!(!adc);
 
@@ -592,8 +575,6 @@ mod tests {
             },
         );
         let env = envs(&cmd);
-        // Endpoint lock yes, authentication claim no: that is the caller's
-        // decision and depends on whether a credential was supplied.
         assert_eq!(
             env.get("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"),
             Some(&Some("true".into()))
