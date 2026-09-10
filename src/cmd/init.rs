@@ -949,6 +949,8 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
 
                 let mut config = existing_config.unwrap_or_default();
                 config.claude.api_key = Some(env_token);
+                config.claude.use_bedrock = false;
+                config.claude.use_vertex = false;
                 config.save()?;
 
                 println!();
@@ -1065,6 +1067,7 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
 
         config.claude.api_key = None;
         config.claude.use_vertex = true;
+        config.claude.use_bedrock = false;
         config.claude.vertex_project_id = Some(project_id.trim().to_string());
         config.claude.vertex_region = if region.trim().is_empty() {
             None
@@ -1132,6 +1135,7 @@ async fn setup_claude(existing_config: Option<Config>) -> Result<()> {
 
         config.claude.api_key = Some(credential);
         config.claude.use_vertex = false;
+        config.claude.use_bedrock = false;
         config.claude.vertex_project_id = None;
         config.claude.vertex_region = None;
         config.claude.vertex_credentials_path = None;

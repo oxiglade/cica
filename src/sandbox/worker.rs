@@ -1293,6 +1293,14 @@ impl DockerLauncher {
     }
 
     fn worker_run_args(&self, spec: &WorkerSpec) -> Vec<String> {
+        self.worker_run_args_with_env(spec, |name| std::env::var_os(name).is_some())
+    }
+
+    fn worker_run_args_with_env(
+        &self,
+        spec: &WorkerSpec,
+        present: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
         let name = Self::worker_name(spec);
         let mut args = vec![
             "run".into(),
@@ -1307,6 +1315,31 @@ impl DockerLauncher {
             "-e".into(),
             "CICA_STATE_PATH=/data/cica/internal/state-store".into(),
         ];
+        for name in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_SDK_LOAD_CONFIG",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_EC2_METADATA_DISABLED",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        ] {
+            if present(name) {
+                args.extend(["-e".into(), name.into()]);
+            }
+        }
         for (key, value) in &self.env {
             args.extend(["-e".into(), format!("{key}={value}")]);
         }
@@ -1550,6 +1583,30 @@ mod tests {
         assert!(args.contains(&"cica-abcdefghijklmnopqrstuvwx-token-1".into()));
         let worker_args = worker_spec().args();
         assert_eq!(&args[args.len() - worker_args.len()..], worker_args);
+    }
+
+    #[test]
+    fn docker_forwards_present_aws_variables_by_name_only() {
+        let launcher = DockerLauncher::new("image".into(), "/config".into(), None, "/state".into());
+        let args = launcher.worker_run_args_with_env(&worker_spec(), |name| {
+            matches!(
+                name,
+                "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_PROFILE"
+            )
+        });
+        for name in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"] {
+            assert!(args.windows(2).any(|pair| pair == ["-e", name]));
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("AWS_SESSION_TOKEN") || arg.starts_with("AWS_REGION"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("AWS_") && arg.contains('='))
+        );
     }
 
     #[tokio::test]
