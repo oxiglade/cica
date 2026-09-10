@@ -1,6 +1,6 @@
 //! Claude Code integration
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -107,6 +107,44 @@ fn apply_backend_env(cmd: &mut Command, claude: &ClaudeConfig, paths: &Paths) {
     }
 }
 
+fn apply_aws_file_env(
+    cmd: &mut Command,
+    original_home: &std::path::Path,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for (name, filename) in [
+        ("AWS_CONFIG_FILE", "config"),
+        ("AWS_SHARED_CREDENTIALS_FILE", "credentials"),
+    ] {
+        let value =
+            get(name).unwrap_or_else(|| original_home.join(".aws").join(filename).into_os_string());
+        cmd.env(name, value);
+    }
+}
+
+fn prepare_bedrock_home(paths: &Paths, original_home: &std::path::Path) -> Result<()> {
+    let aws = original_home.join(".aws");
+    if !aws.is_dir() || paths.claude_home == original_home {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&paths.claude_home)?;
+    let link = paths.claude_home.join(".aws");
+    // The AWS SDK resolves the SSO cache through HOME even with explicit shared-file paths.
+    match std::os::unix::fs::symlink(&aws, &link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                std::fs::read_link(&link).ok().as_ref() == Some(&aws),
+                "{} already exists and does not link to {}",
+                link.display(),
+                aws.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).context("linking the original AWS directory into Claude's home"),
+    }
+}
+
 pub async fn query_with_options(
     claude: &ClaudeConfig,
     paths: &Paths,
@@ -162,6 +200,16 @@ pub async fn query_with_options(
     info!("Querying Claude: {}", prompt);
     debug!("Using claude_code: {:?}", claude_code);
 
+    let aws_home = if use_bedrock {
+        let home =
+            std::env::home_dir().context("Could not determine the original AWS home directory")?;
+        let home = std::path::absolute(home)?;
+        prepare_bedrock_home(paths, &home)?;
+        Some(home)
+    } else {
+        None
+    };
+
     let build_command = |resume_session: Option<&str>| {
         let mut cmd = Command::new(&program);
         cmd.args(&prefix_args)
@@ -195,6 +243,9 @@ pub async fn query_with_options(
         cmd.arg(prompt);
 
         apply_backend_env(&mut cmd, claude, paths);
+        if let Some(home) = &aws_home {
+            apply_aws_file_env(&mut cmd, home, |name| std::env::var_os(name));
+        }
 
         cmd
     };
@@ -305,6 +356,58 @@ mod tests {
             &Paths::for_base(std::path::PathBuf::from("/worker")),
         );
         envs(&cmd)
+    }
+
+    #[test]
+    fn bedrock_shared_files_point_to_original_home_and_respect_overrides() {
+        let mut cmd = Command::new("claude");
+        super::apply_aws_file_env(&mut cmd, std::path::Path::new("/original"), |_| None);
+        let env = envs(&cmd);
+        assert_eq!(env["AWS_CONFIG_FILE"], Some("/original/.aws/config".into()));
+        assert_eq!(
+            env["AWS_SHARED_CREDENTIALS_FILE"],
+            Some("/original/.aws/credentials".into())
+        );
+
+        let mut cmd = Command::new("claude");
+        super::apply_aws_file_env(&mut cmd, std::path::Path::new("/original"), |name| {
+            (name == "AWS_CONFIG_FILE").then(|| std::ffi::OsString::from("/explicit/config"))
+        });
+        let env = envs(&cmd);
+        assert_eq!(env["AWS_CONFIG_FILE"], Some("/explicit/config".into()));
+        assert_eq!(
+            env["AWS_SHARED_CREDENTIALS_FILE"],
+            Some("/original/.aws/credentials".into())
+        );
+
+        let mut cmd = Command::new("claude");
+        super::apply_aws_file_env(&mut cmd, std::path::Path::new("/original"), |_| {
+            Some(std::ffi::OsString::new())
+        });
+        let env = envs(&cmd);
+        assert_eq!(env["AWS_CONFIG_FILE"], Some(String::new()));
+        assert_eq!(env["AWS_SHARED_CREDENTIALS_FILE"], Some(String::new()));
+    }
+
+    #[test]
+    fn bedrock_home_shares_the_original_sso_cache_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("original");
+        let cache = home.join(".aws/sso/cache/token.json");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "old-token").unwrap();
+        let paths = Paths::for_base(dir.path().join("cica"));
+        super::prepare_bedrock_home(&paths, &home).unwrap();
+        super::prepare_bedrock_home(&paths, &home).unwrap();
+        assert_eq!(
+            std::fs::read_link(paths.claude_home.join(".aws")).unwrap(),
+            home.join(".aws")
+        );
+        std::fs::write(&cache, "refreshed-token").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(paths.claude_home.join(".aws/sso/cache/token.json")).unwrap(),
+            "refreshed-token"
+        );
     }
 
     const ANTHROPIC_CREDENTIAL_VARS: [&str; 4] = [

@@ -621,17 +621,11 @@ pub struct CursorConfig {
 // Config Operations
 // ============================================================================
 
-/// Truthy/falsy values accepted for boolean env overlays, case-insensitive.
-/// An unrecognised value is ignored with a warning so a typo leaves the config
-/// file's value in place instead of silently flipping it.
-fn env_bool(name: &str, value: &str) -> Option<bool> {
+fn env_bool(name: &str, value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        other => {
-            tracing::warn!("ignoring invalid {name}={other}: expected a boolean");
-            None
-        }
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("invalid {name}: expected a boolean"),
     }
 }
 
@@ -654,7 +648,7 @@ impl Config {
                 return Err(e).with_context(|| format!("Could not read config file: {path:?}"));
             }
         };
-        config.apply_env_overlay();
+        config.apply_env_overlay()?;
         Ok(config)
     }
 
@@ -664,13 +658,16 @@ impl Config {
     /// task env. A provider that cannot deliver the operator's `config.toml`
     /// to the worker (Fargate: command override only, no bind mount) can only
     /// configure what is listed here.
-    pub(crate) fn apply_env_overlay(&mut self) {
-        self.overlay_from_env(|k| std::env::var(k).ok());
+    pub(crate) fn apply_env_overlay(&mut self) -> Result<()> {
+        if let Err(std::env::VarError::NotUnicode(_)) = std::env::var("CICA_CLAUDE_USE_BEDROCK") {
+            anyhow::bail!("invalid CICA_CLAUDE_USE_BEDROCK: expected a boolean");
+        }
+        self.overlay_from_env(|k| std::env::var(k).ok())
     }
 
     /// Env overlay core, parameterized by a lookup so it is testable without
     /// touching the global process environment.
-    fn overlay_from_env(&mut self, get: impl Fn(&str) -> Option<String>) {
+    fn overlay_from_env(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = get("CICA_CURSOR_API_KEY") {
             self.cursor.api_key = Some(v);
         }
@@ -683,10 +680,8 @@ impl Config {
         if let Some(v) = get("CICA_CLAUDE_MODEL") {
             self.claude.model = Some(v);
         }
-        if let Some(v) =
-            get("CICA_CLAUDE_USE_BEDROCK").and_then(|v| env_bool("CICA_CLAUDE_USE_BEDROCK", &v))
-        {
-            self.claude.use_bedrock = v;
+        if let Some(v) = get("CICA_CLAUDE_USE_BEDROCK") {
+            self.claude.use_bedrock = env_bool("CICA_CLAUDE_USE_BEDROCK", &v)?;
         }
         if let Some(v) = get("CICA_CLAUDE_BEDROCK_REGION") {
             self.claude.bedrock_region = Some(v);
@@ -771,6 +766,7 @@ impl Config {
                 .get_or_insert_with(Default::default)
                 .region = Some(v);
         }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1068,7 +1064,7 @@ mod tests {
             "CICA_CLAUDE_API_KEY" => Some("claude-secret".to_string()),
             _ => None,
         };
-        cfg.overlay_from_env(env);
+        cfg.overlay_from_env(env).unwrap();
         assert_eq!(cfg.cursor.api_key.as_deref(), Some("cur-secret"));
         assert_eq!(cfg.claude.api_key.as_deref(), Some("claude-secret"));
     }
@@ -1082,7 +1078,7 @@ mod tests {
             "CICA_CURSOR_MODEL" => Some("auto".to_string()),
             _ => None,
         };
-        cfg.overlay_from_env(env);
+        cfg.overlay_from_env(env).unwrap();
         assert_eq!(cfg.claude.model.as_deref(), Some("opus"));
         assert_eq!(cfg.cursor.model.as_deref(), Some("auto"));
     }
@@ -1096,25 +1092,71 @@ mod tests {
             "CICA_CLAUDE_BEDROCK_REGION" => Some("eu-central-1".to_string()),
             _ => None,
         };
-        cfg.overlay_from_env(env);
+        cfg.overlay_from_env(env).unwrap();
         assert!(cfg.claude.use_bedrock);
         assert_eq!(cfg.claude.bedrock_region.as_deref(), Some("eu-central-1"));
     }
 
     #[test]
-    fn env_overlay_ignores_unparseable_bedrock_flag() {
-        let mut cfg = Config::default();
-        cfg.claude.use_bedrock = true;
-        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "maybe".to_string()));
-        // A typo must not silently send turns back to the Anthropic API.
-        assert!(cfg.claude.use_bedrock);
+    fn env_overlay_rejects_unparseable_bedrock_flag_from_either_default() {
+        for enabled in [false, true] {
+            let mut cfg = Config::default();
+            cfg.claude.use_bedrock = enabled;
+            cfg.claude.api_key = Some("old-anthropic-key".into());
+            let error = cfg
+                .overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "truee".into()))
+                .unwrap_err();
+            assert!(error.to_string().contains("CICA_CLAUDE_USE_BEDROCK"));
+        }
+    }
+
+    #[test]
+    fn config_loading_rejects_invalid_provider_environment() {
+        const CHILD: &str = "CICA_TEST_INVALID_PROVIDER_ENV";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            for existing_file in [false, true] {
+                if existing_file {
+                    std::fs::write(&path, "[claude]\nuse_bedrock = false\n").unwrap();
+                }
+                let error = match Config::load_from(&path) {
+                    Ok(_) => panic!("invalid provider environment was accepted"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("CICA_CLAUDE_USE_BEDROCK"));
+            }
+            return;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        for value in [
+            std::ffi::OsString::from("truee"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::config_loading_rejects_invalid_provider_environment",
+                ])
+                .env(CHILD, "1")
+                .env("CICA_CLAUDE_USE_BEDROCK", value)
+                .env("CICA_CLAUDE_API_KEY", "old-anthropic-key")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 
     #[test]
     fn env_overlay_can_disable_bedrock() {
         let mut cfg = Config::default();
         cfg.claude.use_bedrock = true;
-        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "false".to_string()));
+        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_USE_BEDROCK").then(|| "false".to_string()))
+            .unwrap();
         assert!(!cfg.claude.use_bedrock);
     }
 
@@ -1134,7 +1176,8 @@ mod tests {
     fn env_overlay_model_overrides_config_file_value() {
         let mut cfg = Config::default();
         cfg.claude.model = Some("from-file".into());
-        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_MODEL").then(|| "opus".to_string()));
+        cfg.overlay_from_env(|k| (k == "CICA_CLAUDE_MODEL").then(|| "opus".to_string()))
+            .unwrap();
         assert_eq!(cfg.claude.model.as_deref(), Some("opus"));
     }
 
@@ -1142,7 +1185,7 @@ mod tests {
     fn env_overlay_leaves_model_when_env_absent() {
         let mut cfg = Config::default();
         cfg.claude.model = Some("from-file".into());
-        cfg.overlay_from_env(|_| None);
+        cfg.overlay_from_env(|_| None).unwrap();
         assert_eq!(cfg.claude.model.as_deref(), Some("from-file"));
     }
 
@@ -1150,7 +1193,7 @@ mod tests {
     fn env_overlay_leaves_config_value_when_env_absent() {
         let mut cfg = Config::default();
         cfg.cursor.api_key = Some("from-file".into());
-        cfg.overlay_from_env(|_| None);
+        cfg.overlay_from_env(|_| None).unwrap();
         assert_eq!(cfg.cursor.api_key.as_deref(), Some("from-file"));
     }
 
@@ -1164,7 +1207,7 @@ mod tests {
             "CICA_S3_REGION" => Some("eu-central-1".to_string()),
             _ => None,
         };
-        cfg.overlay_from_env(env);
+        cfg.overlay_from_env(env).unwrap();
         assert_eq!(cfg.backend, AiBackend::Cursor);
         assert_eq!(cfg.deployment.store, Some(StoreKind::S3));
         let s3 = cfg.deployment.s3.unwrap();
@@ -1177,7 +1220,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay_from_env(|key| {
             (key == "CICA_STATE_PATH").then(|| "/data/cica/internal/state-store".to_string())
-        });
+        })
+        .unwrap();
         assert_eq!(
             cfg.deployment.state_path.as_deref(),
             Some("/data/cica/internal/state-store")
@@ -1188,7 +1232,8 @@ mod tests {
     fn env_overlay_ignores_unknown_backend() {
         let mut cfg = Config::default();
         let before = cfg.backend;
-        cfg.overlay_from_env(|k| (k == "CICA_BACKEND").then(|| "bogus".to_string()));
+        cfg.overlay_from_env(|k| (k == "CICA_BACKEND").then(|| "bogus".to_string()))
+            .unwrap();
         assert_eq!(cfg.backend, before);
     }
 
@@ -1204,7 +1249,7 @@ mod tests {
             "CICA_CURSOR_MODEL" => Some("auto".to_string()),
             _ => None,
         };
-        cfg.overlay_from_env(env);
+        cfg.overlay_from_env(env).unwrap();
         assert_eq!(cfg.backend, AiBackend::Cursor);
         assert_eq!(cfg.deployment.store, Some(StoreKind::S3));
         assert_eq!(cfg.cursor.api_key.as_deref(), Some("sekret"));

@@ -49,8 +49,13 @@ pub trait Channel: Send + Sync + 'static {
     async fn send_message_with_attachments(
         &self,
         message: &str,
-        _attachment_paths: &[PathBuf],
+        attachment_paths: &[PathBuf],
     ) -> Result<()> {
+        anyhow::ensure!(
+            attachment_paths.is_empty(),
+            "{} does not support attachments",
+            self.display_name()
+        );
         self.send_message(message).await
     }
 
@@ -535,6 +540,48 @@ mod delivery_tests {
         fn start_typing(&self) -> TypingGuard {
             TypingGuard::noop()
         }
+    }
+
+    #[derive(Default)]
+    struct TextOnly(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Channel for TextOnly {
+        fn name(&self) -> &'static str {
+            "text"
+        }
+        fn display_name(&self) -> &'static str {
+            "Text"
+        }
+        async fn send_message(&self, message: &str) -> Result<()> {
+            self.0.lock().unwrap().push(message.into());
+            Ok(())
+        }
+        fn start_typing(&self) -> TypingGuard {
+            TypingGuard::noop()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_attachment_delivery_rejects_files_without_sending_text() {
+        let channel = TextOnly::default();
+        assert!(
+            channel
+                .send_message_with_attachments("result", &["report.pdf".into()])
+                .await
+                .is_err()
+        );
+        assert!(channel.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_attachment_delivery_sends_text_when_empty() {
+        let channel = TextOnly::default();
+        channel
+            .send_message_with_attachments("result", &[])
+            .await
+            .unwrap();
+        assert_eq!(*channel.0.lock().unwrap(), ["result"]);
     }
 
     fn response_naming_a_file(dir: &Path) -> String {

@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -25,9 +26,11 @@ use crate::sandbox::Affinity;
 use crate::sandbox::state::{FilesystemStateStore, StateStore, default_store, resolved_state_path};
 
 const LINEAR_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+/// Uploads carry a whole file, so they cannot share the API call budget.
+const LINEAR_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn linear_http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().timeout(LINEAR_HTTP_TIMEOUT)
+    reqwest::Client::builder().timeout(LINEAR_UPLOAD_TIMEOUT)
 }
 
 const LINEAR_API: &str = "https://api.linear.app/graphql";
@@ -309,6 +312,40 @@ mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
 }
 "#;
 
+const FILE_UPLOAD_MUTATION: &str = r#"
+mutation FileUpload($contentType: String!, $filename: String!, $size: Int!) {
+  fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+    success
+    uploadFile {
+      uploadUrl
+      assetUrl
+      headers { key value }
+    }
+  }
+}
+"#;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadPayload {
+    success: bool,
+    upload_file: Option<UploadFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadFile {
+    upload_url: String,
+    asset_url: String,
+    headers: Vec<UploadHeader>,
+}
+
+#[derive(Deserialize)]
+struct UploadHeader {
+    key: String,
+    value: String,
+}
+
 /// Authorization-code tokens last 24 hours; client credentials mint 30-day app tokens without refresh tokens, so renewal requires minting again.
 enum Credential {
     Static(String),
@@ -427,20 +464,125 @@ async fn mint_app_token(
     Ok((token, expires_in))
 }
 
+#[async_trait]
+trait LinearTransport: Send + Sync {
+    async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response>;
+}
+
+#[async_trait]
+impl LinearTransport for reqwest::Client {
+    async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response> {
+        Ok(self.execute(request).await?)
+    }
+}
+
 #[derive(Clone)]
 struct LinearApi {
     http: reqwest::Client,
+    transport: Arc<dyn LinearTransport>,
     credential: Arc<Credential>,
 }
 
 impl LinearApi {
     fn new(credential: Credential) -> Self {
+        let http = linear_http_client_builder()
+            .build()
+            .expect("build Linear HTTP client");
         Self {
-            http: linear_http_client_builder()
-                .build()
-                .expect("build Linear HTTP client"),
+            transport: Arc::new(http.clone()),
+            http,
             credential: Arc::new(credential),
         }
+    }
+
+    async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response> {
+        self.execute_within(request, LINEAR_HTTP_TIMEOUT).await
+    }
+
+    async fn execute_within(
+        &self,
+        request: reqwest::Request,
+        limit: Duration,
+    ) -> Result<reqwest::Response> {
+        tokio::time::timeout(limit, self.transport.execute(request))
+            .await
+            .context("Linear HTTP request timed out")?
+    }
+
+    async fn upload_file(&self, path: &Path) -> Result<String> {
+        let filename = path
+            .file_name()
+            .context("attachment has no filename")?
+            .to_string_lossy();
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading attachment {}", path.display()))?;
+        let size =
+            i32::try_from(bytes.len()).context("attachment exceeds Linear's upload size range")?;
+        let content_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        let token = self.credential.token(&self.http).await?;
+        let request = self
+            .http
+            .post(LINEAR_API)
+            .bearer_auth(token)
+            .json(&json!({
+                "query": FILE_UPLOAD_MUTATION,
+                "variables": {"contentType": content_type, "filename": filename, "size": size},
+            }))
+            .build()?;
+        let response = self
+            .execute(request)
+            .await
+            .context("requesting a Linear file upload")?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Linear fileUpload failed ({})",
+            response.status()
+        );
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .context("reading Linear fileUpload response")?;
+        anyhow::ensure!(
+            payload.get("errors").is_none(),
+            "Linear fileUpload returned GraphQL errors"
+        );
+        let payload: UploadPayload = serde_json::from_value(payload["data"]["fileUpload"].clone())
+            .context("invalid Linear fileUpload response")?;
+        anyhow::ensure!(payload.success, "Linear fileUpload was unsuccessful");
+        let upload = payload
+            .upload_file
+            .context("Linear fileUpload returned no upload destination")?;
+        anyhow::ensure!(
+            !upload.asset_url.is_empty(),
+            "Linear fileUpload returned no asset URL"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_TYPE, content_type.parse()?);
+        for header in upload.headers {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(header.key.as_bytes())?,
+                header.value.parse()?,
+            );
+        }
+        let request = self
+            .http
+            .put(&upload.upload_url)
+            .headers(headers)
+            .body(bytes)
+            .build()?;
+        let response = self
+            .execute_within(request, LINEAR_UPLOAD_TIMEOUT)
+            .await
+            .context("uploading a Linear attachment")?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Linear attachment upload failed ({})",
+            response.status()
+        );
+        Ok(upload.asset_url)
     }
 
     async fn create_activity(
@@ -451,7 +593,7 @@ impl LinearApi {
         ephemeral: bool,
     ) -> Result<()> {
         let token = self.credential.token(&self.http).await?;
-        let response = self
+        let request = self
             .http
             .post(LINEAR_API)
             .header("Authorization", format!("Bearer {token}"))
@@ -459,7 +601,9 @@ impl LinearApi {
                 "query": ACTIVITY_MUTATION,
                 "variables": activity_variables(session_id, kind, body, ephemeral),
             }))
-            .send()
+            .build()?;
+        let response = self
+            .execute(request)
             .await
             .context("posting agent activity")?;
 
@@ -468,7 +612,10 @@ impl LinearApi {
 
         // GraphQL reports failures in the body with a 200, so the status alone
         // is not enough.
-        if !status.is_success() || payload.get("errors").is_some() {
+        if !status.is_success()
+            || payload.get("errors").is_some()
+            || payload["data"]["agentActivityCreate"]["success"] != true
+        {
             anyhow::bail!(
                 "agentActivityCreate failed ({}): {}",
                 status,
@@ -506,6 +653,31 @@ impl Channel for LinearChannel {
         self.api
             .create_activity(&self.session_id, ActivityKind::Response, message, false)
             .await
+    }
+
+    async fn send_message_with_attachments(
+        &self,
+        message: &str,
+        attachment_paths: &[PathBuf],
+    ) -> Result<()> {
+        let mut body = message.to_string();
+        for path in attachment_paths {
+            let asset_url = self.api.upload_file(path).await?;
+            let filename = path
+                .file_name()
+                .context("attachment has no filename")?
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('[', "\\[")
+                .replace(']', "\\]")
+                .replace(['\n', '\r'], " ");
+            let asset_url = asset_url.replace('(', "%28").replace(')', "%29");
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(&format!("[{filename}]({asset_url})"));
+        }
+        self.send_message(&body).await
     }
 
     /// An `error` activity puts the Linear session in `error`, so failed turns must use it.
@@ -925,6 +1097,232 @@ pub async fn send_activity(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct UploadTransport {
+        requests: std::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>,
+        fail_upload: bool,
+        graphql_response: Option<serde_json::Value>,
+        stall_upload: bool,
+    }
+
+    #[async_trait]
+    impl LinearTransport for UploadTransport {
+        async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response> {
+            let bytes = Bytes::copy_from_slice(request.body().unwrap().as_bytes().unwrap());
+            let (name, status, body) = if request.url().as_str() == LINEAR_API {
+                assert_eq!(request.method(), reqwest::Method::POST);
+                let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let response = if payload["query"].as_str().unwrap().contains("fileUpload") {
+                    let variables = &payload["variables"];
+                    let filename = variables["filename"].as_str().unwrap();
+                    json!({"data": {"fileUpload": {
+                        "success": true,
+                        "lastSyncId": 1,
+                        "uploadFile": {
+                            "uploadUrl": format!("https://uploads.linear.com/upload/{filename}"),
+                            "assetUrl": format!("https://uploads.linear.com/assets/{filename}"),
+                            "contentType": variables["contentType"],
+                            "filename": filename,
+                            "size": variables["size"],
+                            "headers": [{"key": "x-upload-token", "value": "signed-header"}]
+                        }
+                    }}})
+                } else {
+                    json!({"data": {"agentActivityCreate": {"success": true}}})
+                };
+                let response = self.graphql_response.as_ref().unwrap_or(&response);
+                ("graphql".into(), StatusCode::OK, response.to_string())
+            } else {
+                assert_eq!(request.method(), reqwest::Method::PUT);
+                if self.stall_upload {
+                    std::future::pending::<()>().await;
+                }
+                let name = request
+                    .url()
+                    .path()
+                    .strip_prefix("/upload/")
+                    .unwrap()
+                    .to_string();
+                let status = if self.fail_upload {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::OK
+                };
+                (name, status, String::new())
+            };
+            self.requests
+                .lock()
+                .unwrap()
+                .push((name, request.headers().clone(), bytes));
+            Ok(axum::http::Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap()
+                .into())
+        }
+    }
+
+    fn upload_channel(transport: Arc<UploadTransport>) -> LinearChannel {
+        LinearChannel::new(
+            LinearApi {
+                http: linear_http_client_builder().no_proxy().build().unwrap(),
+                transport,
+                credential: Arc::new(Credential::Static("test-token".into())),
+            },
+            "session-1".into(),
+        )
+    }
+
+    async fn assert_attachment_delivery(files: &[(&str, &[u8], &str)]) {
+        let transport = Arc::new(UploadTransport::default());
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = files
+            .iter()
+            .map(|(name, bytes, _)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        upload_channel(transport.clone())
+            .send_message_with_attachments("Here are the files.", &paths)
+            .await
+            .unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), files.len() * 2 + 1);
+        for (index, (filename, bytes, content_type)) in files.iter().enumerate() {
+            let (_, headers, body) = &requests[index * 2];
+            assert_eq!(headers["authorization"], "Bearer test-token");
+            let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                request["variables"],
+                json!({"filename": filename, "size": bytes.len(), "contentType": content_type})
+            );
+            let (name, headers, body) = &requests[index * 2 + 1];
+            assert_eq!(name, filename);
+            assert_eq!(headers["x-upload-token"], "signed-header");
+            assert_eq!(headers["content-type"], *content_type);
+            assert!(!headers.contains_key("authorization"));
+            assert_eq!(body.as_ref(), *bytes);
+        }
+        let activity: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().2).unwrap();
+        assert!(
+            activity["query"]
+                .as_str()
+                .unwrap()
+                .contains("agentActivityCreate")
+        );
+        assert_eq!(
+            activity["variables"]["input"]["agentSessionId"],
+            "session-1"
+        );
+        assert_eq!(
+            activity["variables"]["input"]["content"]["type"],
+            "response"
+        );
+        let body = activity["variables"]["input"]["content"]["body"]
+            .as_str()
+            .unwrap();
+        assert!(body.starts_with("Here are the files."));
+        for (filename, _, _) in files {
+            assert!(body.contains(&format!(
+                "[{filename}](https://uploads.linear.com/assets/{filename})"
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn one_attachment_is_uploaded_and_linked_in_one_activity() {
+        assert_attachment_delivery(&[("report.txt", b"report", "text/plain")]).await;
+    }
+
+    #[tokio::test]
+    async fn several_attachments_are_uploaded_and_linked_in_one_activity() {
+        assert_attachment_delivery(&[
+            ("report.txt", b"report", "text/plain"),
+            ("data.json", b"{}", "application/json"),
+            ("raw.unknown-extension", b"raw", "application/octet-stream"),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_failure_prevents_the_activity() {
+        let transport = Arc::new(UploadTransport {
+            fail_upload: true,
+            ..Default::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        std::fs::write(&path, "report").unwrap();
+        assert!(
+            upload_channel(transport.clone())
+                .send_message_with_attachments("result", &[path])
+                .await
+                .is_err()
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].0, "report.txt");
+    }
+
+    #[tokio::test]
+    async fn invalid_upload_preparation_never_puts_or_posts_an_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        std::fs::write(&path, "report").unwrap();
+        for response in [
+            json!({"errors": [{"message": "denied"}]}),
+            json!({"data": {"fileUpload": {"success": false, "uploadFile": null}}}),
+            json!({"data": {"fileUpload": {"success": true, "uploadFile": null}}}),
+            json!({}),
+        ] {
+            let transport = Arc::new(UploadTransport {
+                graphql_response: Some(response),
+                ..Default::default()
+            });
+            assert!(
+                upload_channel(transport.clone())
+                    .send_message_with_attachments("result", std::slice::from_ref(&path))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attachment_upload_obeys_the_linear_timeout() {
+        let transport = Arc::new(UploadTransport {
+            stall_upload: true,
+            ..Default::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        std::fs::write(&path, "report").unwrap();
+        let error = upload_channel(transport)
+            .send_message_with_attachments("result", &[path])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn an_unsuccessful_activity_is_a_delivery_error() {
+        let transport = Arc::new(UploadTransport {
+            graphql_response: Some(json!({"data": {"agentActivityCreate": {"success": false}}})),
+            ..Default::default()
+        });
+        assert!(
+            upload_channel(transport.clone())
+                .send_message_with_attachments("result", &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
     struct RecordingProvider(tokio::sync::mpsc::UnboundedSender<crate::sandbox::TurnJob>);
 
     #[async_trait]
@@ -984,6 +1382,12 @@ mod tests {
             session_locks: Default::default(),
             session_ticket: Default::default(),
         });
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
         (
             AppState {
                 in_flight: InFlightTurns::default(),
@@ -993,12 +1397,8 @@ mod tests {
                 config: Arc::new(linear),
                 rt,
                 api: LinearApi {
-                    http: reqwest::Client::builder()
-                        .no_proxy()
-                        .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
-                        .timeout(Duration::from_millis(100))
-                        .build()
-                        .unwrap(),
+                    transport: Arc::new(http.clone()),
+                    http,
                     credential: Arc::new(Credential::Static("test".into())),
                 },
             },
