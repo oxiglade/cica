@@ -7,6 +7,9 @@ the task exits itself after `worker_idle_secs` (default 600) of inactivity or
 `worker_max_age_secs` (default 86400). Nothing about networking, the state store bucket, or
 credentials changes. The items below are the complete list.
 
+For the later job-selected provider rollout, also follow section 9. Registering an image
+revision alone does not replace warm workers that are already running.
+
 ## 1. Rollout order (the one that causes an outage if wrong)
 
 Deploy the worker image before the router. A 0.12 router launches workers with
@@ -85,3 +88,48 @@ execution and task roles. The worker task role is unchanged.
 
 Deploy the 0.11.2 router again; leave the 0.12.0 image in place. Warm workers already running
 exit on their own within `worker_idle_secs`; the old router ignores them.
+
+## 9. Rolling out job-selected provider routing
+
+The router now sends the Claude destination with each job: Anthropic, Bedrock with its
+region, or Vertex with its project and region. Bedrock takes precedence over Vertex.
+Distributed Bedrock jobs require `bedrock_region`; Vertex still defaults its region to
+`europe-west1`. Models come from the job too, including `None`, which selects the backend
+default instead of a warm worker's configured model. Direct onboarding still uses the
+router's configured model. `provider = local` keeps its existing behavior.
+
+1. Build and register the updated worker image, with the credentials or role permissions
+   needed for the intended providers. Keep the image's supported Claude Code version
+   (`^2.1.258` or later compatible 2.x). Point the router's task definition at that revision.
+2. Deploy the updated router. Task definition registration only affects future launches;
+   routers can adopt existing warm workers. The routing guarantee starts when the new
+   router refuses to dispatch to workers without `job_routing_version = 1` in their own
+   heartbeat, including on the first turn after launch.
+3. An incompatible worker is stopped, with termination confirmed, before a replacement is
+   launched. The router waits up to `worker_start_timeout_secs` for the replacement's
+   heartbeat. If that image also lacks the capability, it stops the replacement and fails
+   the turn without publishing a job or inbox assignment. An unconfirmed stop also fails
+   the turn; it does not launch a second worker.
+
+Credentials remain worker-local: jobs contain no keys, tokens, or credential-file paths.
+A capable warm worker can switch destination on its next turn, but receiving a target does
+not update its credentials or verify its AWS account or Google identity. Provision new
+credentials through the worker deployment when needed.
+
+For explicit distributed jobs, cica removes inherited competing provider selectors,
+authentication overrides, endpoint overrides (including `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_BEDROCK_BASE_URL`, and `ANTHROPIC_VERTEX_BASE_URL`), model pins, and per-model
+Vertex regions. Custom inference endpoints are not supported on this path. It sets
+[`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`](https://code.claude.com/docs/en/env-vars)
+so settings cannot restore provider, endpoint, or authentication overrides. Settings and
+skills still load normally. Nonempty `modelOverrides` or `fallbackModel` in user, project,
+or local Claude settings are rejected for these jobs because they can remap an explicit
+model. This includes shared local settings in the main worktree when using a linked worktree.
+
+The global wire protocol version stays at 1. Old routers can use new workers: a job without
+`claude_target` falls back to that worker's provider configuration, so an old router still
+requires deployment agreement. New routers reject old workers before dispatch. No policy,
+configuration, or credential digest is added to the capability.
+
+Stored jobs retain their submission-time destination when replayed. Drain or cancel
+outstanding old work if the migration needs a hard cutoff; this change does not revoke it.

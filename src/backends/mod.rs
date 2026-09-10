@@ -50,6 +50,8 @@ pub struct QueryOptions {
     pub skip_permissions: bool,
     /// Alias or full id. `None` = the backend CLI's own default.
     pub model: Option<String>,
+    pub claude_target: Option<crate::sandbox::ClaudeTarget>,
+    pub dispatched: bool,
 }
 
 /// Result returned by all AI backends.
@@ -79,7 +81,7 @@ pub async fn query_with_options(
     config: &Config,
     paths: &Paths,
     prompt: &str,
-    mut options: QueryOptions,
+    options: QueryOptions,
 ) -> Result<QueryResult> {
     // Test hook: a deterministic response without invoking the real backend CLI.
     // Inert unless `CICA_FAKE_BACKEND` is set (used only by the Docker CI test).
@@ -87,7 +89,6 @@ pub async fn query_with_options(
         return Ok(fake_result(prompt));
     }
 
-    options.model = effective_model(options.model, backend, config);
     match backend {
         AiBackend::Claude => {
             claude::query_with_options(&config.claude, paths, prompt, options).await
@@ -96,14 +97,6 @@ pub async fn query_with_options(
             cursor::query_with_options(&config.cursor, paths, prompt, options).await
         }
     }
-}
-
-fn effective_model(
-    requested: Option<String>,
-    backend: AiBackend,
-    config: &Config,
-) -> Option<String> {
-    requested.or_else(|| config.model_for(backend))
 }
 
 #[cfg(test)]
@@ -131,34 +124,5 @@ mod tests {
         assert_eq!(r.response, "fake-response: ping");
         assert_eq!(r.session_id, "");
         assert_eq!(r.cost_usd, None);
-    }
-
-    #[test]
-    fn effective_model_prefers_the_job() {
-        let mut cfg = Config::default();
-        cfg.claude.model = Some("configured".into());
-        assert_eq!(
-            effective_model(Some("requested".into()), AiBackend::Claude, &cfg).as_deref(),
-            Some("requested")
-        );
-    }
-
-    #[test]
-    fn effective_model_falls_back_per_backend() {
-        let mut cfg = Config::default();
-        cfg.claude.model = Some("claude-model".into());
-        cfg.cursor.model = Some("cursor-model".into());
-        assert_eq!(
-            effective_model(None, AiBackend::Claude, &cfg).as_deref(),
-            Some("claude-model")
-        );
-        assert_eq!(
-            effective_model(None, AiBackend::Cursor, &cfg).as_deref(),
-            Some("cursor-model")
-        );
-        cfg.claude.model = None;
-        cfg.cursor.model = None;
-        assert_eq!(effective_model(None, AiBackend::Claude, &cfg), None);
-        assert_eq!(effective_model(None, AiBackend::Cursor, &cfg), None);
     }
 }

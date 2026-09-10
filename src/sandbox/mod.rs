@@ -22,6 +22,55 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{AiBackend, Config, Paths};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ClaudeTarget {
+    Anthropic,
+    Bedrock { region: Option<String> },
+    Vertex { project: String, region: String },
+}
+
+impl ClaudeTarget {
+    pub fn from_config(config: &crate::config::ClaudeConfig) -> Self {
+        if config.use_bedrock {
+            Self::Bedrock {
+                region: config.bedrock_region.clone().filter(|s| !s.is_empty()),
+            }
+        } else if config.use_vertex {
+            Self::Vertex {
+                project: config.vertex_project_id.clone().unwrap_or_default(),
+                region: config
+                    .vertex_region
+                    .clone()
+                    .unwrap_or_else(|| "europe-west1".into()),
+            }
+        } else {
+            Self::Anthropic
+        }
+    }
+
+    pub fn validate_distributed(&self) -> Result<()> {
+        let valid_region = |region: &str| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        };
+        match self {
+            Self::Bedrock { region } => anyhow::ensure!(
+                region.as_deref().is_some_and(valid_region),
+                "distributed Bedrock turns require a valid explicit bedrock_region"
+            ),
+            Self::Vertex { project, region } => anyhow::ensure!(
+                !project.trim().is_empty() && valid_region(region),
+                "distributed Vertex turns require an explicit project and a valid region"
+            ),
+            Self::Anthropic => {}
+        }
+        Ok(())
+    }
+}
+
 /// A single agent turn to execute.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Affinity {
@@ -81,6 +130,8 @@ pub struct TurnJob {
     pub backend: AiBackend,
     /// Model alias or full id selected by the router.
     pub model: Option<String>,
+    /// `None` is a legacy job: use the worker's provider configuration.
+    pub claude_target: Option<ClaudeTarget>,
     /// Workspace-relative paths of attachments this turn references.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -100,6 +151,7 @@ struct TurnJobWire {
     skip_permissions: bool,
     backend: AiBackend,
     model: Option<String>,
+    claude_target: Option<ClaudeTarget>,
     #[serde(default)]
     attachments: Vec<String>,
 }
@@ -122,13 +174,14 @@ impl<'de> serde::Deserialize<'de> for TurnJob {
             skip_permissions: wire.skip_permissions,
             backend: wire.backend,
             model: wire.model,
+            claude_target: wire.claude_target,
             attachments: wire.attachments,
         })
     }
 }
 
 impl TurnJob {
-    /// The router's turn contract: backend and model are decided here, from the router's
+    /// The router's turn contract: backend, target, and model come from the router's
     /// config, and the worker honours them regardless of its own environment.
     pub fn new(
         config: &Config,
@@ -150,6 +203,7 @@ impl TurnJob {
             skip_permissions: true,
             backend: config.backend,
             model: config.model_for(config.backend),
+            claude_target: Some(ClaudeTarget::from_config(&config.claude)),
             attachments: Vec::new(),
         }
     }
@@ -326,6 +380,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn job_round_trip_preserves_the_provider_destination() {
+        let value = serde_json::json!({
+            "channel": "telegram", "user_id": "1", "prompt": "hi",
+            "system_prompt": null, "resume_session": null,
+            "skip_permissions": true, "backend": "claude", "model": null,
+            "claude_target": {"provider": "vertex", "project": "router-project", "region": "europe-west1"}
+        });
+        let job: TurnJob = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(job).unwrap()["claude_target"],
+            value["claude_target"]
+        );
+    }
+
+    #[test]
+    fn router_resolves_destination_precedence_without_serializing_credentials() {
+        let mut config = Config::default();
+        config.claude.api_key = Some("secret-key".into());
+        config.claude.vertex_credentials_path = Some("secret-path".into());
+        config.claude.vertex_project_id = Some("router-project".into());
+        config.claude.bedrock_region = Some("eu-central-1".into());
+        for (bedrock, vertex, expected) in [
+            (
+                true,
+                true,
+                serde_json::json!({"provider": "bedrock", "region": "eu-central-1"}),
+            ),
+            (
+                false,
+                true,
+                serde_json::json!({"provider": "vertex", "project": "router-project", "region": "europe-west1"}),
+            ),
+            (false, false, serde_json::json!({"provider": "anthropic"})),
+        ] {
+            config.claude.use_bedrock = bedrock;
+            config.claude.use_vertex = vertex;
+            let job = TurnJob::new(
+                &config,
+                "telegram",
+                "1",
+                Affinity::Cron {
+                    job_id: "cron".into(),
+                },
+                "hi".into(),
+                None,
+                None,
+            );
+            let value = serde_json::to_value(job).unwrap();
+            assert_eq!(value["claude_target"], expected);
+            assert!(!value.to_string().contains("secret-"));
+        }
+    }
+
+    #[test]
     fn subprocess_provider_requires_a_store() {
         let (_temp, paths) = crate::config::test_paths();
         use crate::config::{Config, ProviderKind};
@@ -422,6 +530,7 @@ mod tests {
             skip_permissions: true,
             backend: crate::config::AiBackend::Claude,
             model: None,
+            claude_target: None,
             attachments: Vec::new(),
         };
         let json = serde_json::to_string(&job).unwrap();
@@ -493,6 +602,7 @@ mod tests {
         let job: TurnJob = serde_json::from_str(json).unwrap();
         assert_eq!(job.channel, "telegram");
         assert_eq!(job.resume_session.as_deref(), Some("sess-1"));
+        assert_eq!(job.claude_target, None);
     }
 
     #[test]
