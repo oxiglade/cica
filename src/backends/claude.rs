@@ -56,12 +56,20 @@ fn config_relative_path(paths: &Paths, value: &str) -> std::path::PathBuf {
     }
 }
 
+/// Point Claude Code at the target, and report whether cica handed it a
+/// credential for that target.
+///
+/// The answer decides `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` in the caller: the
+/// flag tells Claude Code the host owns authentication, and Claude Code then
+/// stops consulting ambient credential providers. Claiming it while supplying
+/// nothing leaves the turn unable to authenticate at all.
+#[must_use]
 fn apply_backend_env(
     cmd: &mut Command,
     claude: &ClaudeConfig,
     paths: &Paths,
     target: &ClaudeTarget,
-) {
+) -> bool {
     match target {
         ClaudeTarget::Bedrock { region } => {
             cmd.env("CLAUDE_CODE_USE_BEDROCK", "1");
@@ -76,17 +84,26 @@ fn apply_backend_env(
             ] {
                 cmd.env_remove(name);
             }
+            // Deliberately none: Bedrock credentials come from the AWS chain --
+            // an instance profile, an ECS task role, a shared profile -- which
+            // is the point of role-based auth. cica never sees them.
+            false
         }
         ClaudeTarget::Vertex { project, region } => {
             cmd.env("CLAUDE_CODE_USE_VERTEX", "1")
                 .env("ANTHROPIC_VERTEX_PROJECT_ID", project)
                 .env("CLOUD_ML_REGION", region);
+            // A service-account file is a credential cica supplies; falling
+            // back to gcloud ADC is the ambient chain, same as Bedrock's.
+            let mut supplied = false;
             if let Some(ref cred_path) = claude.vertex_credentials_path {
                 let abs = config_relative_path(paths, cred_path);
                 if abs.exists() {
                     cmd.env("GOOGLE_APPLICATION_CREDENTIALS", &abs);
+                    supplied = true;
                 }
             }
+            supplied
         }
         ClaudeTarget::Anthropic => {
             if let Some(cred) = claude.api_key.as_deref() {
@@ -99,6 +116,9 @@ fn apply_backend_env(
                         cmd.env("ANTHROPIC_OAUTH_TOKEN", cred);
                     }
                 }
+                true
+            } else {
+                false
             }
         }
     }
@@ -157,9 +177,11 @@ fn isolate_backend_env(cmd: &mut Command, target: &ClaudeTarget) {
     if !matches!(target, ClaudeTarget::Vertex { .. }) {
         cmd.env_remove("GOOGLE_APPLICATION_CREDENTIALS");
     }
-    // Claude Code must also ignore routing supplied by user/project/managed settings.
-    cmd.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1")
-        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
+    // Claude Code must also ignore endpoints supplied by user/project/managed
+    // settings. The provider/auth half of that lock is
+    // CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, which the caller sets only when we
+    // actually supply a credential -- see apply_backend_env.
+    cmd.env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true");
 }
 
 async fn reject_model_routing_settings(paths: &Paths) -> Result<()> {
@@ -365,7 +387,15 @@ pub async fn query_with_options(
         if authoritative {
             isolate_backend_env(&mut cmd, &target);
         }
-        apply_backend_env(&mut cmd, claude, paths, &target);
+        let host_credential = apply_backend_env(&mut cmd, claude, paths, &target);
+        // Only claim the host owns authentication when it does. Claude Code
+        // reads this flag as "credentials come from the host" and stops
+        // consulting ambient providers -- an EC2 instance profile, an ECS task
+        // role, gcloud ADC -- so setting it for a role-based Bedrock or ADC
+        // Vertex deployment leaves the turn with no way to authenticate.
+        if authoritative && host_credential {
+            cmd.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
+        }
         if let Some(home) = &aws_home {
             apply_aws_file_env(&mut cmd, home, |name| std::env::var_os(name));
         }
@@ -453,7 +483,7 @@ mod tests {
 
     use super::{
         ClaudeResponse, apply_backend_env, config_relative_path, is_missing_conversation,
-        served_models,
+        isolate_backend_env, served_models,
     };
     use crate::config::{ClaudeConfig, Paths};
 
@@ -472,14 +502,103 @@ mod tests {
     }
 
     fn applied(claude: &ClaudeConfig) -> HashMap<String, Option<String>> {
+        applied_with_credential(claude, &Paths::for_base("/worker".into())).0
+    }
+
+    /// The environment handed to Claude Code, plus whether cica supplied the
+    /// credential for it -- the answer that gates
+    /// CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST.
+    fn applied_with_credential(
+        claude: &ClaudeConfig,
+        paths: &Paths,
+    ) -> (HashMap<String, Option<String>>, bool) {
         let mut cmd = Command::new("claude");
-        apply_backend_env(
+        let supplied = apply_backend_env(
             &mut cmd,
             claude,
-            &Paths::for_base(std::path::PathBuf::from("/worker")),
+            paths,
             &crate::sandbox::ClaudeTarget::from_config(claude),
         );
-        envs(&cmd)
+        (envs(&cmd), supplied)
+    }
+
+    #[test]
+    fn bedrock_supplies_no_credential_so_the_host_does_not_manage_auth() {
+        let (_, supplied) = applied_with_credential(
+            &ClaudeConfig {
+                use_bedrock: true,
+                bedrock_region: Some("eu-central-1".into()),
+                ..Default::default()
+            },
+            &Paths::for_base("/worker".into()),
+        );
+        // Bedrock credentials come from the AWS chain -- an instance profile or
+        // an ECS task role. Claiming host-managed auth here stops Claude Code
+        // consulting that chain and the turn cannot authenticate at all.
+        assert!(!supplied);
+    }
+
+    #[test]
+    fn an_api_key_is_a_host_supplied_credential() {
+        let (_, supplied) = applied_with_credential(
+            &ClaudeConfig {
+                api_key: Some("sk-ant-api03-real".into()),
+                ..Default::default()
+            },
+            &Paths::for_base("/worker".into()),
+        );
+        assert!(supplied);
+    }
+
+    #[test]
+    fn anthropic_without_a_key_supplies_nothing() {
+        let (_, supplied) =
+            applied_with_credential(&ClaudeConfig::default(), &Paths::for_base("/worker".into()));
+        assert!(!supplied);
+    }
+
+    #[test]
+    fn vertex_supplies_a_credential_only_with_a_service_account_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::for_base(dir.path().to_path_buf());
+        paths.config_file = dir.path().join("config.toml");
+        let key = dir.path().join("sa.json");
+
+        let vertex = |path: Option<&str>| ClaudeConfig {
+            use_vertex: true,
+            vertex_project_id: Some("a-project".into()),
+            vertex_region: Some("europe-west1".into()),
+            vertex_credentials_path: path.map(str::to_string),
+            ..Default::default()
+        };
+
+        // gcloud ADC is the ambient chain, the same shape as Bedrock's.
+        let (_, adc) = applied_with_credential(&vertex(None), &paths);
+        assert!(!adc);
+
+        std::fs::write(&key, "{}").unwrap();
+        let (env, file) = applied_with_credential(&vertex(Some("sa.json")), &paths);
+        assert!(file);
+        assert!(env.contains_key("GOOGLE_APPLICATION_CREDENTIALS"));
+    }
+
+    #[test]
+    fn isolation_does_not_claim_host_managed_auth_on_its_own() {
+        let mut cmd = Command::new("claude");
+        isolate_backend_env(
+            &mut cmd,
+            &crate::sandbox::ClaudeTarget::Bedrock {
+                region: Some("eu-central-1".into()),
+            },
+        );
+        let env = envs(&cmd);
+        // Endpoint lock yes, authentication claim no: that is the caller's
+        // decision and depends on whether a credential was supplied.
+        assert_eq!(
+            env.get("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"),
+            Some(&Some("true".into()))
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"));
     }
 
     #[tokio::test]
