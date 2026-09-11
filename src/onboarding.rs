@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::{self, ChannelSettings, Config, Paths};
 use crate::memory::MemoryIndex;
@@ -216,6 +216,63 @@ fn workspace_relative(path: &Path, base: &Path) -> String {
 ///
 /// If `user_message` is provided, it will be used to search for relevant memories
 /// to include in the context.
+/// How many memory chunks the similarity search returns for a turn.
+const MEMORY_SEARCH_LIMIT: usize = 3;
+
+/// Chunks scoring at or below this are not pasted into the prompt. Deliberately
+/// a named constant: it is the knob this behaviour is tuned with, and 0.3 has
+/// been observed admitting chunks with no topical relationship to the question.
+const MEMORY_SCORE_THRESHOLD: f32 = 0.3;
+
+/// The `### Relevant Memories` block, or nothing.
+///
+/// Split out from prompt assembly so the threshold behaviour can be tested
+/// without an index and an embedding model behind it.
+fn render_relevant_memories(results: Vec<crate::memory::MemorySearchResult>) -> Vec<String> {
+    let (kept, dropped): (Vec<_>, Vec<_>) = results
+        .into_iter()
+        .partition(|r| r.score > MEMORY_SCORE_THRESHOLD);
+
+    // What gets pasted into the prompt is otherwise invisible: nobody reads the
+    // assembled system prompt. Log it per turn so the threshold can be tuned
+    // against evidence, and so an answer that names something nobody asked
+    // about can be checked against what the model was actually handed.
+    if !kept.is_empty() || !dropped.is_empty() {
+        let summary = |rs: &[crate::memory::MemorySearchResult]| {
+            rs.iter()
+                .map(|r| format!("{}({:.2})", r.path, r.score))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        info!(
+            injected_chars = kept.iter().map(|r| r.chunk.len()).sum::<usize>(),
+            threshold = MEMORY_SCORE_THRESHOLD,
+            injected = %summary(&kept),
+            below_threshold = %summary(&dropped),
+            "memory retrieval",
+        );
+    }
+
+    if kept.is_empty() {
+        return Vec::new();
+    }
+
+    // The heading is emitted only now. It used to be pushed ahead of the score
+    // filter, so a turn whose every hit fell below the threshold produced a
+    // "Relevant Memories" heading with nothing under it.
+    let mut lines = vec![
+        "### Relevant Memories".to_string(),
+        "The following memories may be relevant to this conversation:".to_string(),
+        String::new(),
+    ];
+    for result in kept {
+        lines.push(format!("**From {}:**", result.path));
+        lines.push(result.chunk);
+        lines.push(String::new());
+    }
+    lines
+}
+
 pub fn build_context_prompt_for_user(
     config: &Config,
     paths: &Paths,
@@ -602,24 +659,8 @@ IMPORTANT: Do not modify the `state` fields of jobs with `last_status: "Running"
         // Search for relevant memories if we have a user message
         if let Some(query) = user_message {
             match MemoryIndex::open(paths) {
-                Ok(index) => match index.search(ch, uid, query, 3) {
-                    Ok(results) if !results.is_empty() => {
-                        lines.push("### Relevant Memories".to_string());
-                        lines.push(
-                            "The following memories may be relevant to this conversation:"
-                                .to_string(),
-                        );
-                        lines.push(String::new());
-
-                        for result in results {
-                            if result.score > 0.3 {
-                                lines.push(format!("**From {}:**", result.path));
-                                lines.push(result.chunk);
-                                lines.push(String::new());
-                            }
-                        }
-                    }
-                    Ok(_) => {}
+                Ok(index) => match index.search(ch, uid, query, MEMORY_SEARCH_LIMIT) {
+                    Ok(results) => lines.extend(render_relevant_memories(results)),
                     Err(e) => {
                         warn!("Failed to search memories: {}", e);
                     }
@@ -658,6 +699,50 @@ mod memory_guidance_tests {
         assert!(prompt.contains(crate::memory::MEMORIES_DIR_TOKEN));
         assert!(!prompt.contains("propose-knowledge"));
         assert!(!prompt.contains("org-wide"));
+    }
+
+    fn hit(path: &str, score: f32) -> crate::memory::MemorySearchResult {
+        crate::memory::MemorySearchResult {
+            path: path.to_string(),
+            chunk: format!("chunk from {path}"),
+            score,
+        }
+    }
+
+    #[test]
+    fn a_heading_is_only_emitted_when_something_clears_the_threshold() {
+        // Every hit below the threshold used to still produce the heading and
+        // its "may be relevant" preamble, with no memories underneath.
+        let all_weak = render_relevant_memories(vec![
+            hit("methodology-contacts.md", 0.29),
+            hit("preferences.md", 0.12),
+        ]);
+        assert!(all_weak.is_empty(), "got {all_weak:?}");
+
+        let some_strong = render_relevant_memories(vec![
+            hit("project-sprout.md", 0.61),
+            hit("methodology-contacts.md", 0.29),
+        ]);
+        let text = some_strong.join("\n");
+        assert!(text.contains("### Relevant Memories"));
+        assert!(text.contains("project-sprout.md"));
+        assert!(
+            !text.contains("methodology-contacts.md"),
+            "a chunk below the threshold was injected: {text}"
+        );
+    }
+
+    #[test]
+    fn nothing_retrieved_means_nothing_added() {
+        assert!(render_relevant_memories(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn the_threshold_is_exclusive_at_the_boundary() {
+        assert!(render_relevant_memories(vec![hit("a.md", MEMORY_SCORE_THRESHOLD)]).is_empty());
+        assert!(
+            !render_relevant_memories(vec![hit("a.md", MEMORY_SCORE_THRESHOLD + 0.01)]).is_empty()
+        );
     }
 
     #[test]
