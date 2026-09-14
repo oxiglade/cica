@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::sandbox::state::StateStore;
@@ -758,7 +758,29 @@ impl SandboxProvider for LaunchedWorkerProvider {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        let _guard = lock.lock().await;
+        // One turn per affinity at a time. That is right -- two workers racing on
+        // one session's state would corrupt it -- but for a Slack DM the affinity
+        // is the *user*, while the session is the thread, so a person's second
+        // thread waits behind their first with nothing said about it. Whether
+        // that is rare or routine has never been measurable, because waiting
+        // here produces no record at all. See DAT-634.
+        let _guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let waiting_since = Instant::now();
+                info!(
+                    affinity = %affinity_id,
+                    "turn queued behind another turn on the same affinity"
+                );
+                let guard = lock.lock().await;
+                info!(
+                    affinity = %affinity_id,
+                    waited_secs = waiting_since.elapsed().as_secs(),
+                    "queued turn starting"
+                );
+                guard
+            }
+        };
         let owner = self.ensure_worker(&job.affinity).await?;
         let turn_id = Uuid::new_v4().to_string();
         let mut cancel = CancelGuard {
