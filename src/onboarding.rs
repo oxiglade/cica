@@ -212,31 +212,17 @@ fn workspace_relative(path: &Path, base: &Path) -> String {
         .to_string()
 }
 
-/// Build system prompt with all context for a specific user
-///
-/// If `user_message` is provided, it will be used to search for relevant memories
-/// to include in the context.
-/// How many memory chunks the similarity search returns for a turn.
 const MEMORY_SEARCH_LIMIT: usize = 3;
 
-/// Chunks scoring at or below this are not pasted into the prompt. Deliberately
-/// a named constant: it is the knob this behaviour is tuned with, and 0.3 has
-/// been observed admitting chunks with no topical relationship to the question.
+/// A threshold of 0.3 has admitted chunks unrelated to the question.
 const MEMORY_SCORE_THRESHOLD: f32 = 0.3;
 
 /// The `### Relevant Memories` block, or nothing.
-///
-/// Split out from prompt assembly so the threshold behaviour can be tested
-/// without an index and an embedding model behind it.
 fn render_relevant_memories(results: Vec<crate::memory::MemorySearchResult>) -> Vec<String> {
     let (kept, dropped): (Vec<_>, Vec<_>) = results
         .into_iter()
         .partition(|r| r.score > MEMORY_SCORE_THRESHOLD);
 
-    // What gets pasted into the prompt is otherwise invisible: nobody reads the
-    // assembled system prompt. Log it per turn so the threshold can be tuned
-    // against evidence, and so an answer that names something nobody asked
-    // about can be checked against what the model was actually handed.
     if !kept.is_empty() || !dropped.is_empty() {
         let summary = |rs: &[crate::memory::MemorySearchResult]| {
             rs.iter()
@@ -245,7 +231,7 @@ fn render_relevant_memories(results: Vec<crate::memory::MemorySearchResult>) -> 
                 .join(", ")
         };
         info!(
-            injected_chars = kept.iter().map(|r| r.chunk.len()).sum::<usize>(),
+            injected_chars = kept.iter().map(|r| r.chunk.chars().count()).sum::<usize>(),
             threshold = MEMORY_SCORE_THRESHOLD,
             injected = %summary(&kept),
             below_threshold = %summary(&dropped),
@@ -257,9 +243,6 @@ fn render_relevant_memories(results: Vec<crate::memory::MemorySearchResult>) -> 
         return Vec::new();
     }
 
-    // The heading is emitted only now. It used to be pushed ahead of the score
-    // filter, so a turn whose every hit fell below the threshold produced a
-    // "Relevant Memories" heading with nothing under it.
     let mut lines = vec![
         "### Relevant Memories".to_string(),
         "The following memories may be relevant to this conversation:".to_string(),
@@ -273,6 +256,10 @@ fn render_relevant_memories(results: Vec<crate::memory::MemorySearchResult>) -> 
     lines
 }
 
+/// Build system prompt with all context for a specific user
+///
+/// If `user_message` is provided, it will be used to search for relevant memories
+/// to include in the context.
 pub fn build_context_prompt_for_user(
     config: &Config,
     paths: &Paths,
@@ -711,8 +698,6 @@ mod memory_guidance_tests {
 
     #[test]
     fn a_heading_is_only_emitted_when_something_clears_the_threshold() {
-        // Every hit below the threshold used to still produce the heading and
-        // its "may be relevant" preamble, with no memories underneath.
         let all_weak = render_relevant_memories(vec![
             hit("methodology-contacts.md", 0.29),
             hit("preferences.md", 0.12),
