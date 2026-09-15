@@ -252,24 +252,25 @@ async fn send_slack_message(
     thread_ts: Option<&str>,
     message: &str,
 ) -> Result<()> {
+    use crate::channels::slack::{markdown_message_chunks, markdown_to_mrkdwn};
     use slack_morphism::prelude::*;
 
     let client = SlackClient::new(SlackClientHyperConnector::new()?);
     let token = SlackApiToken::new(bot_token.into());
     let session = client.open_session(&token);
 
-    let mrkdwn_message = crate::channels::slack::markdown_to_mrkdwn(message);
+    for chunk in markdown_message_chunks(message) {
+        let content = SlackMessageContent::new()
+            .with_text(markdown_to_mrkdwn(&chunk))
+            .with_blocks(vec![SlackMarkdownBlock::new(chunk).into()]);
+        let mut request = SlackApiChatPostMessageRequest::new(channel_id.into(), content);
 
-    let mut request = SlackApiChatPostMessageRequest::new(
-        channel_id.into(),
-        SlackMessageContent::new().with_text(mrkdwn_message),
-    );
+        if let Some(ts) = thread_ts {
+            request = request.with_thread_ts(ts.into());
+        }
 
-    if let Some(ts) = thread_ts {
-        request = request.with_thread_ts(ts.into());
+        session.chat_post_message(&request).await?;
     }
-
-    session.chat_post_message(&request).await?;
     Ok(())
 }
 

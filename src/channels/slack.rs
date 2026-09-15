@@ -7,7 +7,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use unicode_width::UnicodeWidthStr;
 
 use super::{
     Channel, Identity, TypingGuard, UserTaskManager, build_text_with_images, determine_action,
@@ -108,195 +107,81 @@ async fn set_suggested_prompts(
     }
 }
 
-const TABLE_RENDER_BUDGET: usize = 8 * 1024;
+const MARKDOWN_BLOCK_LIMIT: usize = 11_000;
+
+pub fn markdown_message_chunks(text: &str) -> Vec<String> {
+    const CLOSE_FENCE: &str = "\n```";
+
+    let mut line_end = 0;
+    let fence_ends: Vec<usize> = text
+        .split_inclusive('\n')
+        .filter_map(|line| {
+            line_end += line.len();
+            let trimmed = line.trim_start();
+            trimmed
+                .starts_with("```")
+                .then_some(line_end - trimmed.len() + 3)
+        })
+        .collect();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut in_fence = false;
+
+    loop {
+        let prefix = if in_fence { "```\n" } else { "" };
+        let remaining = &text[start..];
+        let budget = MARKDOWN_BLOCK_LIMIT - prefix.len();
+        let Some((mut max_end, _)) = remaining.char_indices().nth(budget) else {
+            chunks.push(format!("{prefix}{remaining}"));
+            break;
+        };
+
+        loop {
+            let mut offset = 0;
+            let mut blank_line = None;
+            let mut newline = None;
+            for line in remaining[..max_end].split_inclusive('\n') {
+                offset += line.len();
+                if line.ends_with('\n') {
+                    newline = Some(offset);
+                    if line.trim().is_empty() {
+                        blank_line = Some(offset);
+                    }
+                }
+            }
+            let mut end = start + blank_line.or(newline).unwrap_or(max_end);
+
+            let fence_count = fence_ends.partition_point(|&fence_end| fence_end <= end);
+            if let Some(&fence_end) = fence_ends.get(fence_count) {
+                end = end.min(fence_end - 3);
+            }
+            let next_in_fence = !fence_count.is_multiple_of(2);
+            if next_in_fence && text[start..end].chars().count() + CLOSE_FENCE.len() > budget {
+                max_end = remaining
+                    .char_indices()
+                    .nth(budget - CLOSE_FENCE.len())
+                    .unwrap()
+                    .0;
+                continue;
+            }
+
+            let suffix = if next_in_fence { CLOSE_FENCE } else { "" };
+            chunks.push(format!("{prefix}{}{suffix}", &text[start..end]));
+            start = end;
+            in_fence = next_in_fence;
+            break;
+        }
+    }
+
+    chunks
+}
+
 static MARKDOWN_LINK_RE: LazyLock<regex_lite::Regex> =
     LazyLock::new(|| regex_lite::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
 
-/// True for the `|---|:--:|` row that makes the line above it a table header.
-fn is_table_separator(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with('|')
-        && line.contains('-')
-        && line
-            .chars()
-            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
-}
-
-fn is_table_row(line: &str) -> bool {
-    line.trim().starts_with('|')
-}
-
-/// Split `| a | b |` into its cells, without the empties the outer pipes would create.
-fn table_cells(line: &str) -> Vec<String> {
-    let trimmed = line.trim();
-    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
-    let mut cells = Vec::new();
-    let mut start = 0;
-    let mut escaped = false;
-    for (i, ch) in inner.char_indices() {
-        if ch == '|' && !escaped {
-            cells.push(&inner[start..i]);
-            start = i + 1;
-        }
-        escaped = ch == '\\' && !escaped;
-    }
-    if start < inner.len() || cells.is_empty() {
-        cells.push(&inner[start..]);
-    }
-    cells
-        .into_iter()
-        // Slack code blocks render no markup.
-        .map(|c| {
-            MARKDOWN_LINK_RE
-                .replace_all(c, "$1")
-                .replace(r"\|", "|")
-                .replace("**", "")
-                .replace('`', "")
-                .trim()
-                .to_string()
-        })
-        .collect()
-}
-
-fn cell(row: &[String], c: usize) -> &str {
-    row.get(c).map(String::as_str).unwrap_or("")
-}
-
-fn looks_numeric(cell: &str) -> bool {
-    let stripped: String = cell
-        .chars()
-        .filter(|c| !matches!(c, ',' | ' ' | '%' | '€' | '$' | '+'))
-        .collect();
-    !stripped.is_empty() && stripped.parse::<f64>().is_ok()
-}
-
-/// Slack has no tables; fenced blocks guarantee a monospace font.
-fn tables_to_code_blocks(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut in_fence = false;
-
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            out.push(line.to_string());
-            i += 1;
-            continue;
-        }
-        if in_fence
-            || !is_table_row(line)
-            || i + 1 >= lines.len()
-            || !is_table_separator(lines[i + 1])
-        {
-            out.push(line.to_string());
-            i += 1;
-            continue;
-        }
-
-        let header = table_cells(line);
-        let mut body: Vec<Vec<String>> = Vec::new();
-        let mut j = i + 2;
-        while j < lines.len() && is_table_row(lines[j]) && !is_table_separator(lines[j]) {
-            body.push(table_cells(lines[j]));
-            j += 1;
-        }
-
-        let width = body
-            .iter()
-            .map(Vec::len)
-            .chain(std::iter::once(header.len()))
-            .max()
-            .unwrap_or(0);
-
-        let widths: Vec<usize> = (0..width)
-            .map(|c| {
-                std::iter::once(cell(&header, c))
-                    .chain(body.iter().map(|row| cell(row, c)))
-                    .map(UnicodeWidthStr::width)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        let projected_size = widths
-            .iter()
-            .try_fold(0usize, |sum, &w| sum.checked_add(w))
-            .and_then(|sum| sum.checked_add(width.checked_mul(2)?))
-            .and_then(|row_width| body.len().checked_add(2)?.checked_mul(row_width));
-        if projected_size.is_none_or(|size| size > TABLE_RENDER_BUDGET) {
-            out.extend(lines[i..j].iter().map(|line| (*line).to_string()));
-            i = j;
-            continue;
-        }
-
-        let numeric: Vec<bool> = (0..width)
-            .map(|c| {
-                let mut any = false;
-                for row in &body {
-                    let v = cell(row, c);
-                    if v.is_empty() {
-                        continue;
-                    }
-                    if !looks_numeric(v) {
-                        return false;
-                    }
-                    any = true;
-                }
-                any
-            })
-            .collect();
-
-        let render = |row: &[String]| {
-            (0..width)
-                .map(|c| {
-                    let v = cell(row, c);
-                    let pad = widths[c].saturating_sub(v.width());
-                    if numeric[c] {
-                        format!("{}{}", " ".repeat(pad), v)
-                    } else {
-                        format!("{}{}", v, " ".repeat(pad))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        };
-
-        out.push("```".to_string());
-        // An empty header would add only a blank line and a rule.
-        if header.iter().any(|h| !h.is_empty()) {
-            out.push(render(&header));
-            out.push(
-                widths
-                    .iter()
-                    .map(|w| "-".repeat(*w))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .trim_end()
-                    .to_string(),
-            );
-        }
-        for row in &body {
-            out.push(render(row));
-        }
-        out.push("```".to_string());
-
-        i = j;
-    }
-
-    let mut result = out.join("\n");
-    if text.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
 /// Convert standard Markdown to Slack's mrkdwn format.
 pub fn markdown_to_mrkdwn(text: &str) -> String {
-    let mut result = tables_to_code_blocks(text);
+    let mut result = text.to_string();
 
     // Convert bold: **text** -> *text* via placeholder to avoid clobbering single asterisks.
     result = result.replace("**", "\x00BOLD\x00");
@@ -366,33 +251,31 @@ impl Channel for SlackChannel {
         );
         let session = self.client.open_session(&self.token);
 
-        // Convert markdown to Slack's mrkdwn format
-        let mrkdwn_message = markdown_to_mrkdwn(message);
+        for chunk in markdown_message_chunks(message) {
+            let content = SlackMessageContent::new()
+                .with_text(markdown_to_mrkdwn(&chunk))
+                .with_blocks(vec![SlackMarkdownBlock::new(chunk).into()]);
+            let mut request = SlackApiChatPostMessageRequest::new(self.channel_id.clone(), content)
+                .with_unfurl_links(self.unfurl_links)
+                .with_unfurl_media(self.unfurl_links);
 
-        // thread_ts is required for AI Assistant apps to reply in the correct thread.
-        let mut request = SlackApiChatPostMessageRequest::new(
-            self.channel_id.clone(),
-            SlackMessageContent::new().with_text(mrkdwn_message),
-        )
-        .with_unfurl_links(self.unfurl_links)
-        .with_unfurl_media(self.unfurl_links);
-
-        if let Some(ts) = &self.thread_ts {
-            request = request.with_thread_ts(ts.clone());
-        }
-
-        debug!("Request: {:?}", request);
-
-        match session.chat_post_message(&request).await {
-            Ok(response) => {
-                info!("Message sent successfully, ts: {:?}", response.ts);
-                Ok(())
+            if let Some(ts) = &self.thread_ts {
+                request = request.with_thread_ts(ts.clone());
             }
-            Err(e) => {
-                warn!("Failed to send message: {}", e);
-                Err(e.into())
+
+            debug!("Request: {:?}", request);
+
+            match session.chat_post_message(&request).await {
+                Ok(response) => {
+                    info!("Message sent successfully, ts: {:?}", response.ts);
+                }
+                Err(e) => {
+                    warn!("Failed to send message: {}", e);
+                    return Err(e.into());
+                }
             }
         }
+        Ok(())
     }
 
     async fn send_message_with_attachments(
@@ -459,6 +342,7 @@ impl Channel for SlackChannel {
             .with_channel_id(self.channel_id.clone());
 
         if !message.is_empty() {
+            // File uploads accept only an initial_comment string, not Markdown blocks.
             let mrkdwn_message = markdown_to_mrkdwn(message);
             complete_req = complete_req.with_initial_comment(mrkdwn_message);
         }
@@ -1160,122 +1044,215 @@ async fn handle_command_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_slack_attachments_dir, markdown_to_mrkdwn, thinking_status};
+    use super::{
+        MARKDOWN_BLOCK_LIMIT, get_slack_attachments_dir, markdown_message_chunks,
+        markdown_to_mrkdwn, thinking_status,
+    };
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
     use std::time::Duration;
 
     #[test]
-    fn a_table_over_the_render_budget_keeps_its_original_pipes() {
-        for wide_row in [
-            format!("| {} | 1 |\n", "x".repeat(500)),
-            format!("| x | {} |\n", "1".repeat(500)),
-        ] {
-            let input = format!(
-                "| Label | Value |\n|---|---|\n{}{wide_row}",
-                "| x | 1 |\n".repeat(80)
+    fn markdown_chunks_handle_fences_at_the_boundary() {
+        let strip = |s: &str| -> String {
+            s.chars()
+                .filter(|c| *c != '\n' && *c != '`' && *c != '\r')
+                .collect()
+        };
+        let mut checked = 0;
+        for offset in (MARKDOWN_BLOCK_LIMIT - 30)..(MARKDOWN_BLOCK_LIMIT + 30) {
+            for shape in 0..6 {
+                let head = "a".repeat(offset);
+                let input = match shape {
+                    0 => format!("{head}```\n{}", "b".repeat(500)),
+                    1 => format!("{head}\n```\n{}\n```\n", "b".repeat(500)),
+                    2 => format!("```\n{head}\n```\n{}", "b".repeat(500)),
+                    3 => format!("{head}```"),
+                    4 => format!("```rust\n{head}{}", "b".repeat(500)),
+                    _ => format!("{head}\n   ```   \n{}", "b".repeat(500)),
+                };
+                let chunks = markdown_message_chunks(&input);
+                checked += 1;
+                assert!(!chunks.is_empty(), "offset {offset} shape {shape}: none");
+                for (n, chunk) in chunks.iter().enumerate() {
+                    assert!(
+                        chunk.chars().count() <= MARKDOWN_BLOCK_LIMIT,
+                        "offset {offset} shape {shape}: chunk {n} is {} chars",
+                        chunk.chars().count()
+                    );
+                    assert!(
+                        !chunk.is_empty(),
+                        "offset {offset} shape {shape}: chunk {n} empty"
+                    );
+                }
+                assert_eq!(
+                    strip(&chunks.concat()),
+                    strip(&input),
+                    "offset {offset} shape {shape}: content changed"
+                );
+            }
+        }
+        assert!(checked > 300, "{checked}");
+    }
+
+    #[test]
+    fn markdown_chunks_survive_arbitrary_input() {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let strip = |s: &str| -> String {
+            s.chars()
+                .filter(|c| *c != '\n' && *c != '`' && *c != '\r')
+                .collect()
+        };
+        for case in 0..2000 {
+            let mut input = String::new();
+            let pieces = (rng() % 40) as usize;
+            for _ in 0..pieces {
+                match rng() % 10 {
+                    0 => input.push_str("```\n"),
+                    1 => input.push_str("```rust\n"),
+                    2 => input.push('\n'),
+                    3 => input.push_str("\n\n"),
+                    4 => input.push_str(&"x".repeat((rng() % 4000) as usize)),
+                    5 => input.push('🦀'),
+                    6 => input.push_str("  ```  \n"),
+                    7 => input.push_str(&"é".repeat((rng() % 4000) as usize)),
+                    8 => input.push_str("\n \t\n"),
+                    _ => input.push_str("some text "),
+                }
+            }
+            if input.is_empty() {
+                continue;
+            }
+            let chunks = markdown_message_chunks(&input);
+            assert!(!chunks.is_empty(), "case {case}: no chunks");
+            for (n, chunk) in chunks.iter().enumerate() {
+                assert!(
+                    chunk.chars().count() <= MARKDOWN_BLOCK_LIMIT,
+                    "case {case}: chunk {n} is {} chars",
+                    chunk.chars().count()
+                );
+                assert!(!chunk.is_empty(), "case {case}: chunk {n} is empty");
+            }
+            assert_eq!(
+                strip(&chunks.concat()),
+                strip(&input),
+                "case {case}: content changed"
             );
-            let out = markdown_to_mrkdwn(&input);
-            assert_eq!(out.len(), input.len());
-            assert_eq!(out, input);
         }
     }
 
     #[test]
-    fn an_ordinary_table_renders_within_the_budget() {
-        let input = "| A | B |\n|---|---|\n| x | 1 |\n| y | 2 |";
-        assert_eq!(
-            markdown_to_mrkdwn(input),
-            "```\nA  B\n-  -\nx  1\ny  2\n```"
-        );
+    fn markdown_chunks_leave_short_text_unchanged() {
+        for input in [
+            String::new(),
+            "**Hello**\n\n```rust\nlet x = 1;\n```\n".to_string(),
+            "🦀".repeat(MARKDOWN_BLOCK_LIMIT),
+        ] {
+            assert_eq!(markdown_message_chunks(&input), vec![input]);
+        }
     }
 
     #[test]
-    fn table_columns_align_by_display_width() {
-        let input = "| Label | N |\n|---|---|\n| 東京都 | 1 |\n| ASCII | 2 |\n| 😀 | 3 |\n| e\u{0301} | 4 |";
-        assert_eq!(
-            markdown_to_mrkdwn(input),
-            "```\nLabel   N\n------  -\n東京都  1\nASCII   2\n😀      3\ne\u{0301}       4\n```"
-        );
+    fn markdown_chunks_prefer_blank_lines() {
+        for separator in ["\n\n", "\r\n\r\n", "\n \t\n"] {
+            let first = format!("{}{separator}", "a".repeat(6000));
+            let second = format!("{}\n{}", "b".repeat(2000), "c".repeat(6000));
+            let input = format!("{first}{second}");
+            let chunks = markdown_message_chunks(&input);
+
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks.concat(), input);
+            assert_eq!(chunks, vec![first, second]);
+        }
     }
 
     #[test]
-    fn links_in_table_cells_render_as_labels() {
-        let input = "| Link | N |\n|---|---|\n| [site](https://example.com) | 1 |\n| plain | 2 |";
-        assert_eq!(
-            markdown_to_mrkdwn(input),
-            "```\nLink   N\n-----  -\nsite   1\nplain  2\n```"
-        );
+    fn markdown_chunks_split_at_newlines_without_blank_lines() {
+        let first = format!("{}\n", "a".repeat(6000));
+        let second = "b".repeat(6000);
+        let input = format!("{first}{second}");
+        let chunks = markdown_message_chunks(&input);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), input);
+        assert_eq!(chunks, vec![first, second]);
     }
 
     #[test]
-    fn escaped_pipes_stay_in_their_table_cells() {
-        let input = "| Label | N |\n|---|---|\n| a\\|b | 1 |\n| plain | 2 |";
-        assert_eq!(
-            markdown_to_mrkdwn(input),
-            "```\nLabel  N\n-----  -\na|b    1\nplain  2\n```"
-        );
+    fn markdown_chunks_use_line_breaks_at_the_limit() {
+        for first in [
+            format!("{}\n\n", "x".repeat(MARKDOWN_BLOCK_LIMIT - 2)),
+            format!("{}\n", "x".repeat(MARKDOWN_BLOCK_LIMIT - 1)),
+            format!("```\n{}\n```\n\n", "x".repeat(MARKDOWN_BLOCK_LIMIT - 10)),
+        ] {
+            let input = format!("{first}tail");
+            let chunks = markdown_message_chunks(&input);
+
+            assert_eq!(chunks[0].chars().count(), MARKDOWN_BLOCK_LIMIT);
+            assert_eq!(chunks, vec![first, "tail".to_string()]);
+        }
     }
 
     #[test]
-    fn a_markdown_table_becomes_an_aligned_code_block() {
-        // Verbatim from a production answer: Slack rendered these pipes literally.
-        let input = "Comparison is against *57 Fleckvieh farms*:\n\n\
-|  | Farm | p10 | p25 | p50 |\n\
-|---|---|---|---|---|\n\
-| **Total milk EF** | **0.84** | 0.84 | 0.88 | 1.02 |\n\
-| Enteric fermentation | 0.41 | 0.45 | 0.50 | 0.55 |\n\
-| Milk yield (kg FPCM/cow) | 8,403 | 7,782 | 8,088 | 8,372 |\n\n\
-For emission factors lower is better.";
-        let out = markdown_to_mrkdwn(input);
-        assert!(out.contains("```"), "{out}");
+    fn markdown_chunks_hard_split_at_character_boundaries() {
+        let input = "é🦀e\u{0301}".repeat(MARKDOWN_BLOCK_LIMIT);
+        let chunks = markdown_message_chunks(&input);
+
+        assert!(chunks.len() > 1);
         assert!(
-            out.contains("Total milk EF              0.84   0.84   0.88   1.02"),
-            "{out}"
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= MARKDOWN_BLOCK_LIMIT)
         );
-        assert!(
-            out.contains("Milk yield (kg FPCM/cow)  8,403  7,782  8,088  8,372"),
-            "{out}"
-        );
-        assert!(!out.contains('|'), "{out}");
-        assert!(
-            out.contains("                           Farm    p10    p25    p50"),
-            "{out}"
-        );
-        assert!(out.contains("Comparison is against *57 Fleckvieh farms*"));
+        assert_eq!(chunks.concat(), input);
     }
 
     #[test]
-    fn an_unlabelled_first_column_still_aligns() {
-        // `|  | Value |` is the header from a production answer.
-        let input = "|  | Value |\n|---|---|\n| Best in supply base | 0.64 |\n| p10 | 0.84 |";
-        let out = markdown_to_mrkdwn(input);
-        assert_eq!(
-            out,
-            "```\n                     Value\n-------------------  -----\nBest in supply base   0.64\np10                   0.84\n```",
-            "{out}"
-        );
+    fn markdown_chunks_close_and_reopen_code_fences() {
+        for body in [
+            "let value = 1;\n\n".repeat(2000),
+            "🦀".repeat(MARKDOWN_BLOCK_LIMIT * 2 + 1),
+        ] {
+            let input = format!("```rust\n{body}\n```");
+            let chunks = markdown_message_chunks(&input);
+            assert!(chunks.len() > 2);
+
+            let mut recovered = String::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                assert!(chunk.chars().count() <= MARKDOWN_BLOCK_LIMIT);
+                let mut original = chunk.as_str();
+                if i > 0 {
+                    original = original.strip_prefix("```\n").unwrap();
+                }
+                if i + 1 < chunks.len() {
+                    original = original.strip_suffix("\n```").unwrap();
+                }
+                recovered.push_str(original);
+            }
+            assert_eq!(recovered, input);
+        }
     }
 
     #[test]
-    fn a_table_with_no_header_labels_at_all_skips_the_header_row() {
-        let input = "|  |  |\n|---|---|\n| Rows | 12 |\n| Farms | 8 |";
-        let out = markdown_to_mrkdwn(input);
-        assert_eq!(out, "```\nRows   12\nFarms   8\n```", "{out}");
+    fn markdown_chunks_leave_complete_code_fences_alone() {
+        let block = format!("Before\n```rust\n{}\n```\n\n", "x".repeat(6000));
+        let input = block.repeat(2);
+        let chunks = markdown_message_chunks(&input);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), input);
+        assert_eq!(chunks, vec![block.clone(), block]);
     }
 
     #[test]
-    fn a_table_already_inside_a_code_block_is_left_alone() {
-        let input = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```";
+    fn markdown_table_passes_through_unchanged() {
+        let input = "| A | B |\n|---|---|\n| x | 1 |\n| y | 2 |\n";
         assert_eq!(markdown_to_mrkdwn(input), input);
-    }
-
-    #[test]
-    fn prose_with_pipes_is_not_mistaken_for_a_table() {
-        let input = "Use `a | b` for alternation.\nNot a table.";
-        assert_eq!(
-            markdown_to_mrkdwn(input),
-            "Use `a | b` for alternation.\nNot a table."
-        );
     }
 
     #[test]
