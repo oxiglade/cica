@@ -144,11 +144,8 @@ impl MemoryIndex {
     }
 
     /// Index all memory files for a user
-    /// Drop every indexed row for one memory file.
-    ///
-    /// Deleting the file is not enough on its own: the chunk text and its
-    /// embedding live in this database, so an orphaned row keeps being retrieved
-    /// and pasted into prompts long after the memory it came from is gone.
+    /// Chunk text and embeddings live here, not in the file, so deleting the
+    /// file does not stop it being retrieved.
     fn forget_file(&self, channel: &str, user_id: &str, rel_path: &str) -> Result<()> {
         self.db.execute(
             r#"
@@ -176,43 +173,30 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// Forget every indexed file for this user that is no longer on disk.
-    ///
-    /// The store is authoritative and is pulled onto disk before indexing, so a
-    /// file missing here has been deleted — not merely un-synced.
-    fn prune_missing(&self, channel: &str, user_id: &str, present: &[String]) -> Result<usize> {
+    /// The store is pulled onto disk before indexing, so a path missing from
+    /// `present` has been deleted rather than merely not synced.
+    fn prune_missing(&self, channel: &str, user_id: &str, present: &[String]) -> Result<()> {
         let indexed: Vec<String> = self
             .db
             .prepare("SELECT path FROM memory_files WHERE channel = ? AND user_id = ?")?
             .query_map([channel, user_id], |row| row.get(0))?
             .collect::<std::result::Result<_, _>>()?;
 
-        let mut pruned = 0;
         for path in indexed {
             if !present.iter().any(|p| p == &path) {
                 info!("Forgetting deleted memory file: {path}");
                 self.forget_file(channel, user_id, &path)?;
-                pruned += 1;
             }
         }
-        Ok(pruned)
+        Ok(())
     }
 
     pub fn index_user_memories(&mut self, channel: &str, user_id: &str) -> Result<()> {
         let memories_path = memories_dir(&self.paths, channel, user_id);
 
         if !memories_path.exists() {
-            // Not a no-op: a user who deleted their last memory has no directory
-            // at all, and returning here used to leave every chunk they ever
-            // wrote in the index, still retrievable and still injected.
-            let pruned = self.prune_missing(channel, user_id, &[])?;
-            if pruned > 0 {
-                info!(
-                    "Forgot {pruned} memory file(s) for {channel}:{user_id}; none remain on disk"
-                );
-            } else {
-                debug!("No memories directory for {}:{}", channel, user_id);
-            }
+            // No directory means the user deleted their last memory.
+            self.prune_missing(channel, user_id, &[])?;
             return Ok(());
         }
 
@@ -449,7 +433,7 @@ fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Insert an indexed memory file without needing the embedding model.
+    /// Seeds the tables directly, so no embedding model is needed.
     fn seed_file(index: &MemoryIndex, channel: &str, user: &str, path: &str) {
         index
             .db
@@ -495,23 +479,16 @@ mod tests {
         seed_file(&index, "slack", "U1", "preferences.md");
         seed_file(&index, "slack", "U1", "methodology-contacts.md");
 
-        // Only preferences.md is still on disk.
-        let pruned = index
+        index
             .prune_missing("slack", "U1", &["preferences.md".to_string()])
             .unwrap();
 
-        assert_eq!(pruned, 1);
         assert_eq!(indexed_paths(&index, "slack", "U1"), ["preferences.md"]);
-        // The chunk text lives in this database, so forgetting the file has to
-        // take the chunk with it or the content stays retrievable.
         assert_eq!(chunk_count(&index), 1);
     }
 
     #[test]
     fn a_user_who_deleted_everything_keeps_nothing_indexed() {
-        // The production case: no memories directory at all. index_user_memories
-        // used to return early here, leaving every chunk the user ever wrote
-        // indexed and still being injected into their prompts.
         let (_temp, paths) = crate::config::test_paths();
         let mut index = MemoryIndex::open(&paths).unwrap();
         seed_file(&index, "slack", "U1", "methodology-contacts.md");
