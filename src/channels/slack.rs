@@ -107,9 +107,170 @@ async fn set_suggested_prompts(
     }
 }
 
+/// True for the `|---|:--:|` row that makes the line above it a table header.
+fn is_table_separator(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('|')
+        && line.contains('-')
+        && line
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn is_table_row(line: &str) -> bool {
+    line.trim().starts_with('|')
+}
+
+/// Split `| a | b |` into its cells, dropping the empties the outer pipes create.
+fn table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .split('|')
+        // Inside a code block Slack renders no markup, so `*bold*` would show its
+        // own asterisks. Strip the emphasis rather than convert it.
+        .map(|c| c.replace("**", "").replace('`', "").trim().to_string())
+        .collect()
+}
+
+fn cell(row: &[String], c: usize) -> &str {
+    row.get(c).map(String::as_str).unwrap_or("")
+}
+
+fn looks_numeric(cell: &str) -> bool {
+    let stripped: String = cell
+        .chars()
+        .filter(|c| !matches!(c, ',' | ' ' | '%' | '€' | '$' | '+'))
+        .collect();
+    !stripped.is_empty() && stripped.parse::<f64>().is_ok()
+}
+
+/// Render Markdown tables as fixed-width text in a code block.
+///
+/// Slack has no table support: a Markdown table arrives as its literal pipes and
+/// dashes, which is unreadable exactly when the content is a comparison someone
+/// needs to scan. A fenced block is the one place Slack guarantees a monospace
+/// font, so padding the columns there is what makes the table line up.
+fn tables_to_code_blocks(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut in_fence = false;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        // Already fenced, or not a header followed by a separator: pass through.
+        if in_fence
+            || !is_table_row(line)
+            || i + 1 >= lines.len()
+            || !is_table_separator(lines[i + 1])
+        {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        let header = table_cells(line);
+        let mut body: Vec<Vec<String>> = Vec::new();
+        let mut j = i + 2;
+        while j < lines.len() && is_table_row(lines[j]) && !is_table_separator(lines[j]) {
+            body.push(table_cells(lines[j]));
+            j += 1;
+        }
+
+        let width = body
+            .iter()
+            .map(Vec::len)
+            .chain(std::iter::once(header.len()))
+            .max()
+            .unwrap_or(0);
+
+        // Numbers read far better right-aligned, and a column of them is the
+        // reason anyone asked for a table.
+        let numeric: Vec<bool> = (0..width)
+            .map(|c| {
+                let mut any = false;
+                for row in &body {
+                    let v = cell(row, c);
+                    if v.is_empty() {
+                        continue;
+                    }
+                    if !looks_numeric(v) {
+                        return false;
+                    }
+                    any = true;
+                }
+                any
+            })
+            .collect();
+
+        let widths: Vec<usize> = (0..width)
+            .map(|c| {
+                std::iter::once(cell(&header, c))
+                    .chain(body.iter().map(|row| cell(row, c)))
+                    .map(|v| v.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        let render = |row: &[String]| {
+            (0..width)
+                .map(|c| {
+                    let v = cell(row, c);
+                    let pad = widths[c].saturating_sub(v.chars().count());
+                    if numeric[c] {
+                        format!("{}{}", " ".repeat(pad), v)
+                    } else {
+                        format!("{}{}", v, " ".repeat(pad))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        };
+
+        out.push("```".to_string());
+        // A table whose first column is unlabelled produces an all-empty header
+        // row; printing it would just be a blank line and a rule above nothing.
+        if header.iter().any(|h| !h.is_empty()) {
+            out.push(render(&header));
+            out.push(
+                widths
+                    .iter()
+                    .map(|w| "-".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        for row in &body {
+            out.push(render(row));
+        }
+        out.push("```".to_string());
+
+        i = j;
+    }
+
+    let mut result = out.join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 /// Convert standard Markdown to Slack's mrkdwn format.
 pub fn markdown_to_mrkdwn(text: &str) -> String {
-    let mut result = text.to_string();
+    let mut result = tables_to_code_blocks(text);
 
     // Convert bold: **text** -> *text* via placeholder to avoid clobbering single asterisks.
     result = result.replace("**", "\x00BOLD\x00");
@@ -974,10 +1135,83 @@ async fn handle_command_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_slack_attachments_dir, thinking_status};
+    use super::{get_slack_attachments_dir, markdown_to_mrkdwn, thinking_status};
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
     use std::time::Duration;
 
+    #[test]
+    fn a_markdown_table_becomes_an_aligned_code_block() {
+        // Verbatim from a production answer: Slack rendered these pipes literally.
+        let input = "Comparison is against *57 Fleckvieh farms*:\n\n\
+|  | Farm | p10 | p25 | p50 |\n\
+|---|---|---|---|---|\n\
+| **Total milk EF** | **0.84** | 0.84 | 0.88 | 1.02 |\n\
+| Enteric fermentation | 0.41 | 0.45 | 0.50 | 0.55 |\n\
+| Milk yield (kg FPCM/cow) | 8,403 | 7,782 | 8,088 | 8,372 |\n\n\
+For emission factors lower is better.";
+        let out = markdown_to_mrkdwn(input);
+        assert!(out.contains("```"), "{out}");
+        // Numbers right-aligned under their header, labels left-aligned.
+        assert!(
+            out.contains("Total milk EF              0.84   0.84   0.88   1.02"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Milk yield (kg FPCM/cow)  8,403  7,782  8,088  8,372"),
+            "{out}"
+        );
+        // No leftover pipes, and no emphasis asterisks inside the block.
+        assert!(!out.contains('|'), "{out}");
+        assert!(
+            out.contains("                           Farm    p10    p25    p50"),
+            "{out}"
+        );
+        assert!(out.contains("Comparison is against *57 Fleckvieh farms*"));
+    }
+
+    #[test]
+    fn an_unlabelled_first_column_still_aligns() {
+        // `|  | Value |` was the real shape: the first column has no header, the
+        // second does, so the header row is kept and the blank simply pads.
+        let input = "|  | Value |\n|---|---|\n| Best in supply base | 0.64 |\n| p10 | 0.84 |";
+        let out = markdown_to_mrkdwn(input);
+        assert_eq!(
+            out,
+            "```\n                     Value\n-------------------  -----\nBest in supply base   0.64\np10                   0.84\n```",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_header_labels_at_all_skips_the_header_row() {
+        let input = "|  |  |\n|---|---|\n| Rows | 12 |\n| Farms | 8 |";
+        let out = markdown_to_mrkdwn(input);
+        assert_eq!(out, "```\nRows   12\nFarms   8\n```", "{out}");
+    }
+
+    #[test]
+    fn a_table_already_inside_a_code_block_is_left_alone() {
+        let input = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```";
+        assert_eq!(markdown_to_mrkdwn(input), input);
+    }
+
+    #[test]
+    fn prose_with_pipes_is_not_mistaken_for_a_table() {
+        let input = "Use `a | b` for alternation.\nNot a table.";
+        assert_eq!(
+            markdown_to_mrkdwn(input),
+            "Use `a | b` for alternation.\nNot a table."
+        );
+    }
+
+    #[test]
+    fn bold_and_links_still_convert_outside_tables() {
+        let input = "**bold** and [text](https://example.com)";
+        assert_eq!(
+            markdown_to_mrkdwn(input),
+            "*bold* and <https://example.com|text>"
+        );
+    }
     #[test]
     fn slack_download_location_resolves_in_the_prompt() {
         let (_temp, paths) = crate::config::test_paths();
