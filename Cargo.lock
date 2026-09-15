@@ -1047,6 +1047,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
  "which",
  "zip",
