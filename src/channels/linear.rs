@@ -639,6 +639,14 @@ impl LinearChannel {
     }
 }
 
+/// Whether Linear renders this file in the comment body rather than as a link.
+/// SVG is an image Linear does not render inline, so it stays a link, where it
+/// is at least something that works.
+fn renders_inline(path: &Path) -> bool {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    mime.type_() == mime_guess::mime::IMAGE && mime.subtype() != "svg+xml"
+}
+
 #[async_trait]
 impl Channel for LinearChannel {
     fn name(&self) -> &'static str {
@@ -675,7 +683,11 @@ impl Channel for LinearChannel {
             if !body.is_empty() {
                 body.push_str("\n\n");
             }
-            body.push_str(&format!("[{filename}]({asset_url})"));
+            // An image that was asked for is an image meant to be seen. A plain
+            // link renders as a file to click, so images get the `!` and
+            // everything else stays a link.
+            let marker = if renders_inline(path) { "!" } else { "" };
+            body.push_str(&format!("{marker}[{filename}]({asset_url})"));
         }
         self.send_message(&body).await
     }
@@ -1225,10 +1237,18 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(body.starts_with("Here are the files."));
-        for (filename, _, _) in files {
-            assert!(body.contains(&format!(
-                "[{filename}](https://uploads.linear.com/assets/{filename})"
-            )));
+        for (filename, _, content_type) in files {
+            let marker = if content_type.starts_with("image/") && *content_type != "image/svg+xml" {
+                "!"
+            } else {
+                ""
+            };
+            assert!(
+                body.contains(&format!(
+                    "{marker}[{filename}](https://uploads.linear.com/assets/{filename})"
+                )),
+                "{filename} ({content_type}) rendered wrongly in: {body}"
+            );
         }
     }
 
@@ -1238,11 +1258,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_image_is_embedded_so_it_shows_in_the_thread() {
+        // A plain link puts a chart behind a click, which is not what asking for
+        // one means.
+        assert_attachment_delivery(&[("chart.png", b"\x89PNG", "image/png")]).await;
+    }
+
+    #[tokio::test]
+    async fn an_svg_stays_a_link_because_linear_will_not_inline_it() {
+        assert_attachment_delivery(&[("plot.svg", b"<svg/>", "image/svg+xml")]).await;
+    }
+
+    #[tokio::test]
     async fn several_attachments_are_uploaded_and_linked_in_one_activity() {
         assert_attachment_delivery(&[
             ("report.txt", b"report", "text/plain"),
             ("data.json", b"{}", "application/json"),
             ("raw.unknown-extension", b"raw", "application/octet-stream"),
+            ("chart.png", b"\x89PNG", "image/png"),
         ])
         .await;
     }
