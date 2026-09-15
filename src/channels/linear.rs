@@ -639,7 +639,7 @@ impl LinearChannel {
     }
 }
 
-/// Linear does not render SVG inline.
+/// True when Linear renders the file in the comment body. SVG it links instead.
 fn renders_inline(path: &Path) -> bool {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     mime.type_() == mime_guess::mime::IMAGE

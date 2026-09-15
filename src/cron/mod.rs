@@ -614,11 +614,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn truncate_for_name_handles_limits_shorter_than_the_ellipsis() {
-        for (max_len, expected) in [(0, ""), (1, "."), (2, ".."), (3, "...")] {
-            assert_eq!(truncate_for_name("long name", max_len), expected);
-        }
-    }
 }

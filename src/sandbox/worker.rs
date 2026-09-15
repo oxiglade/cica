@@ -758,7 +758,8 @@ impl SandboxProvider for LaunchedWorkerProvider {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        // Slack DM threads share a user's affinity, so they queue behind each other (DAT-634).
+        // One turn per affinity: concurrent workers would corrupt shared session state. Slack
+        // DM threads share a user's affinity, so a second thread queues behind the first (DAT-634).
         let _guard = match lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {

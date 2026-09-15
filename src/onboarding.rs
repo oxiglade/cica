@@ -214,7 +214,7 @@ fn workspace_relative(path: &Path, base: &Path) -> String {
 
 const MEMORY_SEARCH_LIMIT: usize = 3;
 
-/// A threshold of 0.3 has admitted chunks unrelated to the question.
+/// Chunks must score above this; 0.3 has admitted chunks unrelated to the question.
 const MEMORY_SCORE_THRESHOLD: f32 = 0.3;
 
 /// The `### Relevant Memories` block, or nothing.
