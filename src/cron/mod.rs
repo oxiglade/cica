@@ -450,10 +450,12 @@ pub fn parse_add_command(input: &str) -> Result<(CronSchedule, String)> {
 /// Truncate a string for use as a job name.
 pub fn truncate_for_name(s: &str, max_len: usize) -> String {
     let s = s.trim();
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
+    } else if max_len < 3 {
+        ".".repeat(max_len)
     } else {
-        format!("{}...", &s[..max_len - 3])
+        format!("{}...", s.chars().take(max_len - 3).collect::<String>())
     }
 }
 
@@ -592,5 +594,31 @@ mod tests {
     fn test_truncate_for_name() {
         assert_eq!(truncate_for_name("short", 10), "short");
         assert_eq!(truncate_for_name("this is a long name", 10), "this is...");
+    }
+
+    #[test]
+    fn truncate_for_name_preserves_short_unicode_names() {
+        assert_eq!(
+            truncate_for_name("  東京で朝食を食べる  ", 10),
+            "東京で朝食を食べる"
+        );
+    }
+
+    #[test]
+    fn truncate_for_name_handles_multibyte_characters_at_the_cutoff() {
+        for character in ['東', '😀'] {
+            let input = format!("{}{character} morning reminder", "a".repeat(26));
+            assert_eq!(
+                truncate_for_name(&input, 30),
+                format!("{}{character}...", "a".repeat(26))
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_for_name_handles_limits_shorter_than_the_ellipsis() {
+        for (max_len, expected) in [(0, ""), (1, "."), (2, ".."), (3, "...")] {
+            assert_eq!(truncate_for_name("long name", max_len), expected);
+        }
     }
 }
