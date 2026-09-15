@@ -758,12 +758,7 @@ impl SandboxProvider for LaunchedWorkerProvider {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        // One turn per affinity at a time. That is right -- two workers racing on
-        // one session's state would corrupt it -- but for a Slack DM the affinity
-        // is the *user*, while the session is the thread, so a person's second
-        // thread waits behind their first with nothing said about it. Whether
-        // that is rare or routine has never been measurable, because waiting
-        // here produces no record at all. See DAT-634.
+        // Slack DM threads share a user's affinity, so they queue behind each other (DAT-634).
         let _guard = match lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -775,7 +770,7 @@ impl SandboxProvider for LaunchedWorkerProvider {
                 let guard = lock.lock().await;
                 info!(
                     affinity = %affinity_id,
-                    waited_secs = waiting_since.elapsed().as_secs(),
+                    waited_ms = waiting_since.elapsed().as_millis(),
                     "queued turn starting"
                 );
                 guard
