@@ -79,10 +79,11 @@ pub fn system_prompt_for_user(
     settings: &ChannelSettings,
     channel: &str,
     user_id: &str,
+    known_name: Option<&str>,
 ) -> Result<String> {
     match current_phase_for_user(paths, settings, channel, user_id)? {
         Phase::Identity => identity_system_prompt(paths, channel, user_id),
-        Phase::User => user_system_prompt(paths, settings, channel, user_id),
+        Phase::User => user_system_prompt(paths, settings, channel, user_id, known_name),
         Phase::Complete => Ok(String::new()),
     }
 }
@@ -135,6 +136,7 @@ fn user_system_prompt(
     settings: &ChannelSettings,
     channel: &str,
     user_id: &str,
+    known_name: Option<&str>,
 ) -> Result<String> {
     let identity_path = identity_path_for_user(paths, channel, user_id);
     let user_path = user_path_for_user(paths, channel, user_id);
@@ -145,12 +147,25 @@ fn user_system_prompt(
         .onboarding_prompt
         .unwrap_or_else(|| DEFAULT_ONBOARDING_PROMPT.to_string());
 
+    // The channel already told us who this is, so do not ask. A name that gets
+    // asked for is a name that can be invented, and one was.
+    let name_line = match known_name {
+        Some(name) => format!(
+            "Their name is **{name}** -- the messaging platform reports it. Do NOT ask \
+             for their name, and do NOT accept a different one if they offer it. Use \
+             this name, and record it verbatim."
+        ),
+        None => "The platform did not report a name for this user, so ask for one.".to_string(),
+    };
+
     Ok(format!(
         r#"You are an AI assistant with this identity:
 
 {}
 
-You just finished setting up your identity. Now ask the user to tell you about themselves.
+You just finished setting up your identity. Now ask the user about their work.
+
+{}
 
 Keep it casual and short. Use this prompt:
 "{}"
@@ -168,10 +183,18 @@ Use this format:
 After writing the file, greet them by name and ask how you can help.
 
 IMPORTANT:
-- Name is required, but accept whatever else they share
-- Do NOT ask follow-up questions about their profile
+- This is a software company, and a role or team should be one it could actually
+  have. If what they give is plainly a joke -- say "full stack clown", a
+  fictional character, or an obvious insult -- tell them you need a real one and
+  ask once more. Ask ONCE; whatever comes back the second time, take it and move
+  on.
+- Do not interrogate an unusual but plausible answer. Real titles are often odd,
+  and people describe their work in their own language. Only push back on
+  something that is obviously not serious.
+- Do NOT ask follow-up questions beyond that one.
 - After saving, just move on to helping them"#,
         identity,
+        name_line,
         onboarding_prompt,
         user_path.display()
     ))
@@ -689,6 +712,74 @@ mod memory_guidance_tests {
             None,
         )
         .expect("prompt builds")
+    }
+
+    #[test]
+    fn onboarding_uses_the_name_the_platform_reports() {
+        let (_temp, paths) = config::test_paths();
+        let settings = ChannelSettings::default();
+        std::fs::create_dir_all(
+            identity_path_for_user(&paths, "slack", "U1")
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            identity_path_for_user(&paths, "slack", "U1"),
+            "- Name: Sprout",
+        )
+        .unwrap();
+
+        let prompt =
+            user_system_prompt(&paths, &settings, "slack", "U1", Some("Sam Okafor")).unwrap();
+
+        assert!(prompt.contains("Sam Okafor"), "{prompt}");
+        assert!(prompt.contains("Do NOT ask"), "{prompt}");
+    }
+
+    #[test]
+    fn onboarding_asks_for_a_name_only_when_the_platform_has_none() {
+        let (_temp, paths) = config::test_paths();
+        let settings = ChannelSettings::default();
+        std::fs::create_dir_all(
+            identity_path_for_user(&paths, "slack", "U1")
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            identity_path_for_user(&paths, "slack", "U1"),
+            "- Name: Sprout",
+        )
+        .unwrap();
+
+        let prompt = user_system_prompt(&paths, &settings, "slack", "U1", None).unwrap();
+
+        assert!(prompt.contains("did not report a name"), "{prompt}");
+    }
+
+    #[test]
+    fn onboarding_refuses_a_joke_role_once() {
+        let (_temp, paths) = config::test_paths();
+        let settings = ChannelSettings::default();
+        std::fs::create_dir_all(
+            identity_path_for_user(&paths, "slack", "U1")
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            identity_path_for_user(&paths, "slack", "U1"),
+            "- Name: Sprout",
+        )
+        .unwrap();
+
+        let prompt = user_system_prompt(&paths, &settings, "slack", "U1", Some("Sam")).unwrap();
+
+        // Push back once, then accept -- not an interrogation.
+        assert!(prompt.contains("full stack clown"), "{prompt}");
+        assert!(prompt.contains("Ask ONCE"), "{prompt}");
+        assert!(prompt.contains("unusual but plausible"), "{prompt}");
     }
 
     #[test]

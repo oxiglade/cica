@@ -118,8 +118,13 @@ pub enum MessageAction {
     /// Execute a cron job immediately
     ExecuteCronJob { job_id: String },
 
-    /// Run onboarding flow with Claude
-    Onboarding { message: String },
+    /// Run onboarding flow with Claude. `display_name` is the caller's real name
+    /// as the channel reports it, so onboarding need not ask for something it can
+    /// already see.
+    Onboarding {
+        message: String,
+        display_name: Option<String>,
+    },
 
     /// Query Claude with the user's message
     QueryClaude { text: String },
@@ -144,6 +149,10 @@ pub fn determine_action(
     session_key_override: Option<&str>,
 ) -> Result<MessageAction> {
     let text = text.trim();
+
+    // The channel's own name for this person, kept before the pairing store
+    // consumes it -- onboarding should not ask for something we can already see.
+    let known_name = display_name.clone().or_else(|| username.clone());
 
     let mut store = lock(&rt.pairing);
     if !store.is_approved(channel, user_id) {
@@ -189,6 +198,7 @@ pub fn determine_action(
     if !onboarding_complete {
         let message = if text == "/start" { "hi" } else { text };
         return Ok(MessageAction::Onboarding {
+            display_name: known_name,
             message: message.to_string(),
         });
     }
@@ -285,9 +295,19 @@ pub async fn execute_action(
             Ok(None)
         }
 
-        MessageAction::Onboarding { message } => {
+        MessageAction::Onboarding {
+            message,
+            display_name,
+        } => {
             let _typing = channel.start_typing();
-            let response = handle_onboarding(rt, channel.name(), user_id, &message).await?;
+            let response = handle_onboarding(
+                rt,
+                channel.name(),
+                user_id,
+                &message,
+                display_name.as_deref(),
+            )
+            .await?;
             channel.send_message(&response).await?;
             Ok(None)
         }
@@ -1232,9 +1252,11 @@ pub async fn handle_onboarding(
     channel: &str,
     user_id: &str,
     message: &str,
+    display_name: Option<&str>,
 ) -> Result<String> {
     let settings = rt.config.channel_settings(channel);
-    let system_prompt = onboarding::system_prompt_for_user(&rt.paths, &settings, channel, user_id)?;
+    let system_prompt =
+        onboarding::system_prompt_for_user(&rt.paths, &settings, channel, user_id, display_name)?;
 
     let options = backends::QueryOptions {
         system_prompt: Some(system_prompt),
