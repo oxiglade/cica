@@ -837,6 +837,12 @@ async fn handle_message_event(
 /// Messages are formatted as `[speaker]: text` lines.
 const THREAD_CONTEXT_LIMIT: u16 = 50;
 
+/// How far back to read when the mention is a top-level channel message.
+///
+/// Smaller than the thread limit on purpose: a thread is one conversation, a
+/// channel is everyone's, so reaching further back adds noise faster than context.
+const CHANNEL_CONTEXT_LIMIT: u16 = 20;
+
 async fn fetch_thread_context(
     client: &Arc<SlackHyperClient>,
     token: &SlackApiToken,
@@ -882,17 +888,59 @@ async fn fetch_thread_context(
             }
             true
         })
-        .map(|msg| {
-            let speaker = msg
-                .sender
-                .user
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let text = msg.content.text.clone().unwrap_or_default();
-            format!("[{}]: {}", speaker, text)
-        })
+        .map(|msg| format_context_line(msg.sender.user.as_ref(), &msg.content.text))
         .collect()
+}
+
+/// Fetch the recent channel conversation for a mention posted outside any thread.
+///
+/// `conversations.replies` on a message that never started a thread returns that one
+/// message, so the thread path yields nothing here and the agent arrives with only
+/// the words of the mention itself. That is how a `@Sprout try again` — with the
+/// question it refers to sitting right above it as separate channel messages — reached
+/// the agent as no question at all.
+///
+/// No bot watermark: the bot's own last message in a channel is unrelated to this
+/// exchange as often as not, and in the case that prompted this it was an error
+/// notice sitting between the question and the retry, which a watermark would have
+/// taken as permission to drop the question.
+async fn fetch_channel_context(
+    client: &Arc<SlackHyperClient>,
+    token: &SlackApiToken,
+    channel_id: &SlackChannelId,
+    bot_user_id: &SlackUserId,
+    current_msg_ts: &SlackTs,
+) -> Vec<String> {
+    let session = client.open_session(token);
+    let request = SlackApiConversationsHistoryRequest::new()
+        .with_channel(channel_id.clone())
+        .with_latest(current_msg_ts.clone())
+        .with_limit(CHANNEL_CONTEXT_LIMIT);
+
+    let messages = match session.conversations_history(&request).await {
+        Ok(response) => response.messages,
+        Err(e) => {
+            warn!("Failed to fetch channel history: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // conversations.history returns newest first.
+    messages
+        .iter()
+        .rev()
+        .filter(|msg| {
+            msg.origin.ts != *current_msg_ts && msg.sender.user.as_ref() != Some(bot_user_id)
+        })
+        .map(|msg| format_context_line(msg.sender.user.as_ref(), &msg.content.text))
+        .collect()
+}
+
+fn format_context_line(user: Option<&SlackUserId>, text: &Option<String>) -> String {
+    let speaker = user
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("[{}]: {}", speaker, text.clone().unwrap_or_default())
 }
 
 /// Handle @mention events in channels
@@ -1005,15 +1053,31 @@ async fn handle_app_mention_event(
     let (_, display_name) = get_user_info(&client, &state.bot_token, &user_id).await;
     let speaker_name = display_name.unwrap_or_else(|| user_id.to_string());
 
-    let unseen_context = fetch_thread_context(
-        &client,
-        &state.bot_token,
-        &channel_id,
-        &thread_ts,
-        &state.bot_user_id,
-        &event.origin.ts,
-    )
-    .await;
+    // A mention with no thread_ts is a top-level channel message, and asking for its
+    // replies returns only itself. Read the channel instead.
+    let unseen_context = match &event.origin.thread_ts {
+        Some(ts) => {
+            fetch_thread_context(
+                &client,
+                &state.bot_token,
+                &channel_id,
+                ts,
+                &state.bot_user_id,
+                &event.origin.ts,
+            )
+            .await
+        }
+        None => {
+            fetch_channel_context(
+                &client,
+                &state.bot_token,
+                &channel_id,
+                &state.bot_user_id,
+                &event.origin.ts,
+            )
+            .await
+        }
+    };
 
     let channel: Arc<dyn Channel> = Arc::new(SlackChannel::new(
         client.clone(),
@@ -1162,10 +1226,11 @@ async fn handle_command_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        Affinity, SlackTs, dm_affinity_key, get_slack_attachments_dir, markdown_to_mrkdwn,
-        reply_thread, thinking_status,
+        Affinity, SlackTs, dm_affinity_key, format_context_line, get_slack_attachments_dir,
+        markdown_to_mrkdwn, reply_thread, thinking_status,
     };
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
+    use slack_morphism::prelude::SlackUserId;
     use std::time::Duration;
 
     #[test]
@@ -1326,6 +1391,22 @@ For emission factors lower is better.";
         let prompt = build_text_with_images(&paths.base, "look", &[attachment]);
 
         assert_prompt_paths_resolve(&paths.base, &prompt);
+    }
+
+    #[test]
+    fn a_context_line_names_the_speaker() {
+        assert_eq!(
+            format_context_line(
+                Some(&SlackUserId::new("U123".into())),
+                &Some("hello".into())
+            ),
+            "[U123]: hello"
+        );
+    }
+
+    #[test]
+    fn a_context_line_survives_a_missing_sender_and_missing_text() {
+        assert_eq!(format_context_line(None, &None), "[unknown]: ");
     }
 
     #[test]
