@@ -144,11 +144,59 @@ impl MemoryIndex {
     }
 
     /// Index all memory files for a user
+    /// Chunk text and embeddings live here, not in the file, so deleting the
+    /// file does not stop it being retrieved.
+    fn forget_file(&self, channel: &str, user_id: &str, rel_path: &str) -> Result<()> {
+        self.db.execute(
+            r#"
+            DELETE FROM memory_vectors WHERE chunk_id IN (
+                SELECT c.id FROM memory_chunks c
+                JOIN memory_files f ON c.file_id = f.id
+                WHERE f.channel = ? AND f.user_id = ? AND f.path = ?
+            )
+            "#,
+            [channel, user_id, rel_path],
+        )?;
+        self.db.execute(
+            r#"
+            DELETE FROM memory_chunks WHERE file_id IN (
+                SELECT id FROM memory_files
+                WHERE channel = ? AND user_id = ? AND path = ?
+            )
+            "#,
+            [channel, user_id, rel_path],
+        )?;
+        self.db.execute(
+            "DELETE FROM memory_files WHERE channel = ? AND user_id = ? AND path = ?",
+            [channel, user_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// The store is pulled onto disk before indexing, so a path missing from
+    /// `present` has been deleted rather than merely not synced.
+    fn prune_missing(&self, channel: &str, user_id: &str, present: &[String]) -> Result<()> {
+        let indexed: Vec<String> = self
+            .db
+            .prepare("SELECT path FROM memory_files WHERE channel = ? AND user_id = ?")?
+            .query_map([channel, user_id], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+
+        for path in indexed {
+            if !present.iter().any(|p| p == &path) {
+                info!("Forgetting deleted memory file: {path}");
+                self.forget_file(channel, user_id, &path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn index_user_memories(&mut self, channel: &str, user_id: &str) -> Result<()> {
         let memories_path = memories_dir(&self.paths, channel, user_id);
 
         if !memories_path.exists() {
-            debug!("No memories directory for {}:{}", channel, user_id);
+            // No directory means the user deleted their last memory.
+            self.prune_missing(channel, user_id, &[])?;
             return Ok(());
         }
 
@@ -156,6 +204,18 @@ impl MemoryIndex {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
             .collect();
+
+        let present: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let path = entry.path();
+                path.strip_prefix(&memories_path)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        self.prune_missing(channel, user_id, &present)?;
 
         for entry in entries {
             let path = entry.path();
@@ -191,31 +251,7 @@ impl MemoryIndex {
 
             info!("Indexing memory file: {}", rel_path);
 
-            self.db.execute(
-                r#"
-                DELETE FROM memory_vectors WHERE chunk_id IN (
-                    SELECT c.id FROM memory_chunks c
-                    JOIN memory_files f ON c.file_id = f.id
-                    WHERE f.channel = ? AND f.user_id = ? AND f.path = ?
-                )
-                "#,
-                [channel, user_id, &rel_path],
-            )?;
-
-            self.db.execute(
-                r#"
-                DELETE FROM memory_chunks WHERE file_id IN (
-                    SELECT id FROM memory_files
-                    WHERE channel = ? AND user_id = ? AND path = ?
-                )
-                "#,
-                [channel, user_id, &rel_path],
-            )?;
-
-            self.db.execute(
-                "DELETE FROM memory_files WHERE channel = ? AND user_id = ? AND path = ?",
-                [channel, user_id, &rel_path],
-            )?;
+            self.forget_file(channel, user_id, &rel_path)?;
 
             self.db.execute(
                 "INSERT INTO memory_files (channel, user_id, path, hash, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -396,6 +432,86 @@ fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seeds the tables directly, so no embedding model is needed.
+    fn seed_file(index: &MemoryIndex, channel: &str, user: &str, path: &str) {
+        index
+            .db
+            .execute(
+                "INSERT INTO memory_files (channel, user_id, path, hash, updated_at) VALUES (?, ?, ?, 'h', 0)",
+                [channel, user, path],
+            )
+            .unwrap();
+        let file_id = index.db.last_insert_rowid();
+        index
+            .db
+            .execute(
+                "INSERT INTO memory_chunks (file_id, chunk_index, content, start_line, end_line) VALUES (?, 0, 'contact details', 1, 2)",
+                rusqlite::params![file_id],
+            )
+            .unwrap();
+    }
+
+    fn indexed_paths(index: &MemoryIndex, channel: &str, user: &str) -> Vec<String> {
+        index
+            .db
+            .prepare(
+                "SELECT path FROM memory_files WHERE channel = ? AND user_id = ? ORDER BY path",
+            )
+            .unwrap()
+            .query_map([channel, user], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    fn chunk_count(index: &MemoryIndex) -> i64 {
+        index
+            .db
+            .query_row("SELECT COUNT(*) FROM memory_chunks", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_deleted_memory_file_is_forgotten() {
+        let (_temp, paths) = crate::config::test_paths();
+        let index = MemoryIndex::open(&paths).unwrap();
+        seed_file(&index, "slack", "U1", "preferences.md");
+        seed_file(&index, "slack", "U1", "methodology-contacts.md");
+
+        index
+            .prune_missing("slack", "U1", &["preferences.md".to_string()])
+            .unwrap();
+
+        assert_eq!(indexed_paths(&index, "slack", "U1"), ["preferences.md"]);
+        assert_eq!(chunk_count(&index), 1);
+    }
+
+    #[test]
+    fn a_user_who_deleted_everything_keeps_nothing_indexed() {
+        let (_temp, paths) = crate::config::test_paths();
+        let mut index = MemoryIndex::open(&paths).unwrap();
+        seed_file(&index, "slack", "U1", "methodology-contacts.md");
+        assert!(!memories_dir(&paths, "slack", "U1").exists());
+
+        index.index_user_memories("slack", "U1").unwrap();
+
+        assert!(indexed_paths(&index, "slack", "U1").is_empty());
+        assert_eq!(chunk_count(&index), 0);
+    }
+
+    #[test]
+    fn another_users_memories_are_left_alone() {
+        let (_temp, paths) = crate::config::test_paths();
+        let index = MemoryIndex::open(&paths).unwrap();
+        seed_file(&index, "slack", "U1", "gone.md");
+        seed_file(&index, "slack", "U2", "gone.md");
+
+        index.prune_missing("slack", "U1", &[]).unwrap();
+
+        assert!(indexed_paths(&index, "slack", "U1").is_empty());
+        assert_eq!(indexed_paths(&index, "slack", "U2"), ["gone.md"]);
+    }
 
     #[test]
     fn test_chunk_text() {
