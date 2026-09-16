@@ -268,6 +268,14 @@ fn tables_to_code_blocks(text: &str) -> String {
     result
 }
 
+/// A DM with no thread has no session to protect, so it keeps the per-user key.
+fn dm_affinity_key(user_id: &str, thread_ts: Option<&SlackTs>) -> String {
+    match thread_ts {
+        Some(ts) => format!("{user_id}:{ts}"),
+        None => user_id.to_string(),
+    }
+}
+
 /// Convert standard Markdown to Slack's mrkdwn format.
 pub fn markdown_to_mrkdwn(text: &str) -> String {
     let mut result = tables_to_code_blocks(text);
@@ -780,7 +788,12 @@ async fn handle_message_event(
         let session_key_clone = session_key.clone();
         let affinity = Affinity::Chat {
             channel: channel.name().to_string(),
-            user: user_id_str.clone(),
+            // Per thread, not per user. A DM thread is its own conversation with
+            // its own session, so keying on the user alone made one person's
+            // threads queue behind each other for no reason. Carried in the
+            // `user` slot rather than a new variant, as the Linear channel does
+            // with an issue id, so released workers can still decode it.
+            user: dm_affinity_key(&user_id_str, thread_ts.as_ref()),
         };
         let rt = state.rt.clone();
 
@@ -1135,9 +1148,61 @@ async fn handle_command_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_slack_attachments_dir, markdown_to_mrkdwn, thinking_status};
+    use super::{
+        Affinity, SlackTs, dm_affinity_key, get_slack_attachments_dir, markdown_to_mrkdwn,
+        thinking_status,
+    };
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
     use std::time::Duration;
+
+    #[test]
+    fn two_dm_threads_get_two_workers() {
+        let a = Affinity::Chat {
+            channel: "slack".into(),
+            user: dm_affinity_key("U1", Some(&SlackTs("1789131057.645209".into()))),
+        };
+        let b = Affinity::Chat {
+            channel: "slack".into(),
+            user: dm_affinity_key("U1", Some(&SlackTs("1787905099.505869".into()))),
+        };
+        assert_ne!(
+            a.id(),
+            b.id(),
+            "one user's two threads must not share a worker"
+        );
+    }
+
+    #[test]
+    fn the_same_thread_keeps_its_worker() {
+        let ts = SlackTs("1789131057.645209".into());
+        assert_eq!(
+            Affinity::Chat {
+                channel: "slack".into(),
+                user: dm_affinity_key("U1", Some(&ts))
+            }
+            .id(),
+            Affinity::Chat {
+                channel: "slack".into(),
+                user: dm_affinity_key("U1", Some(&ts))
+            }
+            .id()
+        );
+    }
+
+    #[test]
+    fn a_threadless_dm_still_keys_on_the_user() {
+        // No thread means no session key either, so there is nothing to race on.
+        assert_eq!(dm_affinity_key("U1", None), "U1");
+    }
+
+    #[test]
+    fn two_users_in_the_same_thread_are_still_separate() {
+        let ts = SlackTs("1789131057.645209".into());
+        assert_ne!(
+            dm_affinity_key("U1", Some(&ts)),
+            dm_affinity_key("U2", Some(&ts))
+        );
+    }
 
     #[test]
     fn a_markdown_table_becomes_an_aligned_code_block() {
