@@ -276,6 +276,19 @@ fn dm_affinity_key(user_id: &str, thread_ts: Option<&SlackTs>) -> String {
     }
 }
 
+/// Where to post the reply. A DM sent outside an assistant thread carries no
+/// `thread_ts`, and a reply posted without one lands as a top-level message the
+/// assistant pane does not show — the user sees silence. Root the thread at their own
+/// message instead.
+///
+/// **Reply routing only.** The event's own `thread_ts` stays untouched, because it also
+/// keys the Claude session, the debounce id and the worker affinity. Substituting the
+/// message ts there would mint a new session for every threadless DM — a fresh, empty
+/// context on each message — and hand each one its own worker.
+fn reply_thread(thread_ts: Option<&SlackTs>, message_ts: &SlackTs) -> SlackTs {
+    thread_ts.cloned().unwrap_or_else(|| message_ts.clone())
+}
+
 /// Convert standard Markdown to Slack's mrkdwn format.
 pub fn markdown_to_mrkdwn(text: &str) -> String {
     let mut result = tables_to_code_blocks(text);
@@ -753,7 +766,7 @@ async fn handle_message_event(
         client.clone(),
         state.bot_token.clone(),
         channel_id.clone(),
-        thread_ts.clone(),
+        Some(reply_thread(thread_ts.as_ref(), &event.origin.ts)),
         state.unfurl_links,
     ));
 
@@ -1150,7 +1163,7 @@ async fn handle_command_events(
 mod tests {
     use super::{
         Affinity, SlackTs, dm_affinity_key, get_slack_attachments_dir, markdown_to_mrkdwn,
-        thinking_status,
+        reply_thread, thinking_status,
     };
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
     use std::time::Duration;
@@ -1202,6 +1215,31 @@ mod tests {
             dm_affinity_key("U1", Some(&ts)),
             dm_affinity_key("U2", Some(&ts))
         );
+    }
+
+    #[test]
+    fn a_first_message_threads_under_itself() {
+        // The one message guaranteed to have no thread is the first somebody sends,
+        // which is exactly when a silent non-reply costs the most.
+        let ts = SlackTs("1789472075.083909".into());
+        assert_eq!(reply_thread(None, &ts), ts);
+    }
+
+    #[test]
+    fn an_existing_thread_is_left_alone() {
+        let thread = SlackTs("1789467241.350079".into());
+        let message = SlackTs("1789472075.083909".into());
+        assert_eq!(reply_thread(Some(&thread), &message), thread);
+    }
+
+    #[test]
+    fn replying_in_a_thread_does_not_move_the_affinity_key() {
+        // The reply lands under the user's own message, but the affinity stays
+        // per-user — otherwise every threadless DM would get its own worker and
+        // its own empty Claude session.
+        let message = SlackTs("1789472075.083909".into());
+        assert_eq!(reply_thread(None, &message), message);
+        assert_eq!(dm_affinity_key("U1", None), "U1");
     }
 
     #[test]
