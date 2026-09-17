@@ -558,6 +558,30 @@ impl LaunchedWorkerProvider {
         }
     }
 
+    /// Drop cached entries whose worker is gone, freeing their slots.
+    ///
+    /// `owners` only ever loses the entry it was asked about, so a worker that exits
+    /// on its own keeps its slot, and the victim scan below cannot reclaim it: that
+    /// needs a `Ready` heartbeat and a dead worker has none. Without this, a cap of
+    /// `n` refuses every request once `n` workers have exited.
+    ///
+    /// `Booting` is left alone — it may still arrive, and the launch path already
+    /// turns a boot that never lands into `Gone`. `confirm_stop` first, so a merely
+    /// stale heartbeat does not leak a live task.
+    async fn reap_dead_owners(&self, owners: &mut HashMap<String, CachedOwner>) -> Result<()> {
+        let cached = owners
+            .iter()
+            .map(|(id, cached)| (id.clone(), cached.record.clone()))
+            .collect::<Vec<_>>();
+        for (id, record) in cached {
+            if matches!(self.liveness(&id, &record).await?, Liveness::Gone) {
+                self.confirm_stop(&id, &record).await?;
+                owners.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     async fn confirm_stop(&self, id: &str, owner: &OwnerRecord) -> Result<()> {
         let handle = match &owner.handle {
             Some(handle) => Some(handle.clone()),
@@ -655,6 +679,9 @@ impl LaunchedWorkerProvider {
         if owner.is_none() {
             let mut owners = self.owners.lock().await;
             owners.remove(&id);
+            if owners.len() >= self.worker_cap {
+                self.reap_dead_owners(&mut owners).await?;
+            }
             if owners.len() >= self.worker_cap {
                 let candidates = owners
                     .iter()
@@ -2965,6 +2992,92 @@ mod warm_protocol_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_worker_does_not_hold_its_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
+        let (launcher, starts, _, _) = recording_launcher(store.clone(), StopOutcome::Terminated);
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().join("base"),
+            timing(),
+            "policy".into(),
+            1,
+        );
+        let dead = crate::sandbox::Affinity::Cron {
+            job_id: "dead".into(),
+        };
+        let dead_id = dead.id();
+        // At the cap, no heartbeat: gone.
+        provider.owners.lock().await.insert(
+            dead_id.clone(),
+            CachedOwner {
+                record: owner(dead, "gone"),
+                last_dispatch: Instant::now(),
+            },
+        );
+
+        provider
+            .ensure_worker(&crate::sandbox::Affinity::Cron {
+                job_id: "new".into(),
+            })
+            .await
+            .expect("a dead worker's slot must be reclaimable");
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(
+            !provider.owners.lock().await.contains_key(&dead_id),
+            "a dead entry must not hold the cap"
+        );
+    }
+
+    /// Reaping a booting worker would turn a slow start into a lost turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_booting_worker_keeps_its_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStateStore::new(root.path().join("store")));
+        let (launcher, starts, stops, _) =
+            recording_launcher(store.clone(), StopOutcome::Terminated);
+        let provider = LaunchedWorkerProvider::new(
+            store.clone(),
+            Box::new(launcher),
+            root.path().join("base"),
+            timing(),
+            "policy".into(),
+            1,
+        );
+        let booting = crate::sandbox::Affinity::Cron {
+            job_id: "booting".into(),
+        };
+        let booting_id = booting.id();
+        let mut record = owner(booting, "booting");
+        record.phase = OwnerPhase::Launching;
+        record.launched_at_unix = unix_now();
+        provider.owners.lock().await.insert(
+            booting_id.clone(),
+            CachedOwner {
+                record,
+                last_dispatch: Instant::now(),
+            },
+        );
+
+        let error = provider
+            .ensure_worker(&crate::sandbox::Affinity::Cron {
+                job_id: "new".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "all workers busy");
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(stops.lock().unwrap().is_empty());
+        assert!(
+            provider.owners.lock().await.contains_key(&booting_id),
+            "a booting worker must not be reaped"
         );
     }
 
