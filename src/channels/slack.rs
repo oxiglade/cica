@@ -23,6 +23,16 @@ fn get_slack_attachments_dir(paths: &Paths) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Biggest attachment worth pulling onto the worker. Generous for a document,
+/// small enough that a stray video does not stall a turn.
+const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// Checked twice: against `Content-Length` before reading the body, and against the
+/// body itself, because the header is advisory and may be absent or wrong.
+fn attachment_too_big(bytes: usize) -> bool {
+    bytes > MAX_ATTACHMENT_BYTES
+}
+
 async fn download_slack_file(paths: &Paths, file: &SlackFile, bot_token: &str) -> Result<PathBuf> {
     let url = file
         .url_private_download
@@ -52,18 +62,23 @@ async fn download_slack_file(paths: &Paths, file: &SlackFile, bot_token: &str) -
         anyhow::bail!("Failed to download file: {}", response.status());
     }
 
+    if let Some(len) = response.content_length()
+        && attachment_too_big(len as usize)
+    {
+        anyhow::bail!("file is {len} bytes, over the {MAX_ATTACHMENT_BYTES} limit");
+    }
+
     let bytes = response.bytes().await?;
+    if attachment_too_big(bytes.len()) {
+        anyhow::bail!(
+            "file is {} bytes, over the {MAX_ATTACHMENT_BYTES} limit",
+            bytes.len()
+        );
+    }
     std::fs::write(&local_path, &bytes)?;
 
     info!("Downloaded Slack file to {:?}", local_path);
     Ok(local_path)
-}
-
-fn is_image_file(file: &SlackFile) -> bool {
-    file.mimetype
-        .as_ref()
-        .map(|m| m.to_string().starts_with("image/"))
-        .unwrap_or(false)
 }
 
 async fn set_suggested_prompts(
@@ -709,11 +724,13 @@ async fn handle_message_event(
         && let Some(files) = &content.files
     {
         for file in files {
-            if is_image_file(file) {
-                match download_slack_file(&state.rt.paths, file, &state.bot_token_str).await {
-                    Ok(path) => image_paths.push(path),
-                    Err(e) => warn!("Failed to download Slack file: {}", e),
-                }
+            match download_slack_file(&state.rt.paths, file, &state.bot_token_str).await {
+                Ok(path) => image_paths.push(path),
+                Err(e) => warn!(
+                    "Failed to download Slack attachment {}: {}",
+                    file.name.as_deref().unwrap_or("unnamed"),
+                    e
+                ),
             }
         }
     }
@@ -1038,14 +1055,20 @@ async fn handle_app_mention_event(
         }
     }
 
+    // Every attachment, not only images. `build_text_with_images` appends each path to
+    // the prompt and the agent reads a PDF or Markdown file from disk exactly as it
+    // reads a screenshot, so the `image/` gate that used to be here dropped documents
+    // silently — the sender saw nothing and neither did the agent.
     let mut image_paths: Vec<PathBuf> = Vec::new();
     if let Some(files) = &event.content.files {
         for file in files {
-            if is_image_file(file) {
-                match download_slack_file(&state.rt.paths, file, &state.bot_token_str).await {
-                    Ok(path) => image_paths.push(path),
-                    Err(e) => warn!("Failed to download Slack file: {}", e),
-                }
+            match download_slack_file(&state.rt.paths, file, &state.bot_token_str).await {
+                Ok(path) => image_paths.push(path),
+                Err(e) => warn!(
+                    "Failed to download Slack attachment {}: {}",
+                    file.name.as_deref().unwrap_or("unnamed"),
+                    e
+                ),
             }
         }
     }
@@ -1226,8 +1249,9 @@ async fn handle_command_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        Affinity, SlackTs, dm_affinity_key, format_context_line, get_slack_attachments_dir,
-        markdown_to_mrkdwn, reply_thread, thinking_status,
+        Affinity, MAX_ATTACHMENT_BYTES, SlackTs, attachment_too_big, dm_affinity_key,
+        format_context_line, get_slack_attachments_dir, markdown_to_mrkdwn, reply_thread,
+        thinking_status,
     };
     use crate::channels::{assert_prompt_paths_resolve, build_text_with_images};
     use slack_morphism::prelude::SlackUserId;
@@ -1391,6 +1415,14 @@ For emission factors lower is better.";
         let prompt = build_text_with_images(&paths.base, "look", &[attachment]);
 
         assert_prompt_paths_resolve(&paths.base, &prompt);
+    }
+
+    #[test]
+    fn the_attachment_limit_is_a_ceiling_not_a_floor() {
+        assert!(!attachment_too_big(MAX_ATTACHMENT_BYTES));
+        assert!(attachment_too_big(MAX_ATTACHMENT_BYTES + 1));
+        // A document is nowhere near it; the cap exists for stray media.
+        assert!(!attachment_too_big(2 * 1024 * 1024));
     }
 
     #[test]
