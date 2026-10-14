@@ -913,7 +913,7 @@ async fn fetch_thread_context(
 ///
 /// `conversations.replies` on a message that never started a thread returns that one
 /// message, so the thread path yields nothing here and the agent arrives with only
-/// the words of the mention itself. That is how a `@Sprout try again` — with the
+/// the words of the mention itself. That is how a `@Cica try again` — with the
 /// question it refers to sitting right above it as separate channel messages — reached
 /// the agent as no question at all.
 ///

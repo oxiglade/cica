@@ -790,7 +790,7 @@ impl SandboxProvider for LaunchedWorkerProvider {
         // is the *user*, while the session is the thread, so a person's second
         // thread waits behind their first with nothing said about it. Whether
         // that is rare or routine has never been measurable, because waiting
-        // here produces no record at all. See DAT-634.
+        // here produces no record at all.
         let _guard = match lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
