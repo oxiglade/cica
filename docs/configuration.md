@@ -118,7 +118,7 @@ pairing carry over:
 
 ```toml
 [channels.linear.identity]
-"rodrigo@example.com" = "slack:U0123ABC"
+"alice@example.com" = "slack:U0123ABC"
 ```
 
 Matching is case-insensitive. An unmapped person becomes `linear:<their user

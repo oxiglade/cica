@@ -845,7 +845,7 @@ mod tests {
         let mut config = LinearConfig::new("id".into(), "secret".into(), "wh".into());
         config
             .identity
-            .insert("rodrigo@rootglobal.io".into(), "slack:U0123ABC".into());
+            .insert("alice@example.com".into(), "slack:U0123ABC".into());
         config
     }
 
@@ -853,7 +853,7 @@ mod tests {
     fn a_mapped_email_resolves_to_the_other_channels_identity() {
         let config = linear_with_mapping();
         assert_eq!(
-            config.resolve_identity(Some("rodrigo@rootglobal.io"), "usr_1"),
+            config.resolve_identity(Some("alice@example.com"), "usr_1"),
             ("slack".to_string(), "U0123ABC".to_string())
         );
     }
@@ -863,7 +863,7 @@ mod tests {
         // Linear hands back whatever casing the account was created with.
         let config = linear_with_mapping();
         assert_eq!(
-            config.resolve_identity(Some("Rodrigo@RootGlobal.io"), "usr_1"),
+            config.resolve_identity(Some("Alice@Example.com"), "usr_1"),
             ("slack".to_string(), "U0123ABC".to_string())
         );
     }

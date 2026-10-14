@@ -726,7 +726,7 @@ mod memory_guidance_tests {
         .unwrap();
         std::fs::write(
             identity_path_for_user(&paths, "slack", "U1"),
-            "- Name: Sprout",
+            "- Name: Cica",
         )
         .unwrap();
 
@@ -749,7 +749,7 @@ mod memory_guidance_tests {
         .unwrap();
         std::fs::write(
             identity_path_for_user(&paths, "slack", "U1"),
-            "- Name: Sprout",
+            "- Name: Cica",
         )
         .unwrap();
 
@@ -770,7 +770,7 @@ mod memory_guidance_tests {
         .unwrap();
         std::fs::write(
             identity_path_for_user(&paths, "slack", "U1"),
-            "- Name: Sprout",
+            "- Name: Cica",
         )
         .unwrap();
 
@@ -811,12 +811,12 @@ mod memory_guidance_tests {
         assert!(all_weak.is_empty(), "got {all_weak:?}");
 
         let some_strong = render_relevant_memories(vec![
-            hit("project-sprout.md", 0.61),
+            hit("project-atlas.md", 0.61),
             hit("methodology-contacts.md", 0.29),
         ]);
         let text = some_strong.join("\n");
         assert!(text.contains("### Relevant Memories"));
-        assert!(text.contains("project-sprout.md"));
+        assert!(text.contains("project-atlas.md"));
         assert!(
             !text.contains("methodology-contacts.md"),
             "a chunk below the threshold was injected: {text}"

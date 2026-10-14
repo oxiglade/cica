@@ -46,7 +46,7 @@ bot_token = "123456:ABC-your-telegram-bot-token"
 # new channel. Map a Linear email onto the identity they already use elsewhere
 # and their memories, USER.md and pairing carry over.
 # [channels.linear.identity]
-# "rodrigo@example.com" = "slack:U0123ABC"
+# "alice@example.com" = "slack:U0123ABC"
 
 # ----------------------------------------------------------------------------
 # Backend credentials.

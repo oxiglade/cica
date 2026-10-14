@@ -125,7 +125,7 @@ struct AgentActivityContent {
 struct Invocation {
     session_id: String,
     issue_id: String,
-    /// `DAT-633` — for logs and the session label, not for addressing.
+    /// `ENG-123` — for logs and the session label, not for addressing.
     issue_ref: String,
     user_id: String,
     user_email: Option<String>,
@@ -1858,21 +1858,21 @@ mod tests {
       "webhookTimestamp": 1757000000000,
       "agentSession": {
         "id": "sess_1",
-        "issue": { "id": "iss_abc", "identifier": "DAT-633", "title": "Trigger Sprout" },
-        "creator": { "id": "usr_1", "email": "Rodrigo@RootGlobal.io", "name": "Rodrigo Neves" },
+        "issue": { "id": "iss_abc", "identifier": "ENG-123", "title": "Trigger the agent" },
+        "creator": { "id": "usr_1", "email": "Alice@Example.com", "name": "Alice Smith" },
         "comment": {
-          "body": "@Sprout what does this ticket decide?",
-          "user": { "id": "usr_1", "email": "Rodrigo@RootGlobal.io", "displayName": "rodrigo" }
+          "body": "@Cica what does this ticket decide?",
+          "user": { "id": "usr_1", "email": "Alice@Example.com", "displayName": "alice" }
         }
       },
-      "promptContext": "<issue>DAT-633</issue>"
+      "promptContext": "<issue>ENG-123</issue>"
     }"#;
 
     const PROMPTED: &str = r#"{
       "action": "prompted",
       "agentSession": {
         "id": "sess_1",
-        "issue": { "id": "iss_abc", "identifier": "DAT-633" }
+        "issue": { "id": "iss_abc", "identifier": "ENG-123" }
       },
       "agentActivity": { "userId": "usr_2", "content": { "type": "prompt", "body": "and what about the estimate?" } }
     }"#;
@@ -1919,13 +1919,13 @@ mod tests {
 
         assert_eq!(inv.session_id, "sess_1");
         assert_eq!(inv.issue_id, "iss_abc");
-        assert_eq!(inv.issue_ref, "DAT-633");
+        assert_eq!(inv.issue_ref, "ENG-123");
         assert_eq!(inv.user_id, "usr_1");
-        assert_eq!(inv.user_email.as_deref(), Some("Rodrigo@RootGlobal.io"));
-        assert_eq!(inv.user_name.as_deref(), Some("rodrigo"));
-        assert_eq!(inv.title.as_deref(), Some("Trigger Sprout"));
+        assert_eq!(inv.user_email.as_deref(), Some("Alice@Example.com"));
+        assert_eq!(inv.user_name.as_deref(), Some("alice"));
+        assert_eq!(inv.title.as_deref(), Some("Trigger the agent"));
         assert_eq!(inv.prompt, "what does this ticket decide?");
-        assert_eq!(inv.context.as_deref(), Some("<issue>DAT-633</issue>"));
+        assert_eq!(inv.context.as_deref(), Some("<issue>ENG-123</issue>"));
     }
 
     #[test]
@@ -2123,22 +2123,22 @@ mod tests {
     #[test]
     fn the_mention_that_addressed_us_is_dropped() {
         assert_eq!(
-            strip_leading_mentions("@Sprout what does this ticket decide?"),
+            strip_leading_mentions("@Cica what does this ticket decide?"),
             "what does this ticket decide?"
         );
         // Linear can put the agent behind a team mention too.
         assert_eq!(
-            strip_leading_mentions("@Sprout @Data please look"),
+            strip_leading_mentions("@Cica @Platform please look"),
             "please look"
         );
-        assert_eq!(strip_leading_mentions("  @Sprout   hello  "), "hello");
-        assert_eq!(strip_leading_mentions("@Sprout"), "");
+        assert_eq!(strip_leading_mentions("  @Cica   hello  "), "hello");
+        assert_eq!(strip_leading_mentions("@Cica"), "");
     }
 
     #[test]
     fn a_mention_inside_the_question_is_context_and_survives() {
         assert_eq!(
-            strip_leading_mentions("@Sprout did @dave say it shipped?"),
+            strip_leading_mentions("@Cica did @dave say it shipped?"),
             "did @dave say it shipped?"
         );
         assert_eq!(
