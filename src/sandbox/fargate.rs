@@ -331,7 +331,7 @@ impl Launcher for FargateLauncher {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn cfg() -> FargateConfig {
@@ -349,7 +349,7 @@ mod tests {
 
     struct FakeEcs {
         statuses: Mutex<VecDeque<TaskStatus>>,
-        missing: AtomicUsize,
+        missing: Mutex<usize>,
         run_ok: bool,
         stop_called: AtomicBool,
         requests: Mutex<Vec<RunTaskRequest>>,
@@ -359,7 +359,7 @@ mod tests {
         fn new(statuses: Vec<TaskStatus>) -> Self {
             Self {
                 statuses: Mutex::new(statuses.into()),
-                missing: AtomicUsize::new(0),
+                missing: Mutex::new(0),
                 run_ok: true,
                 stop_called: AtomicBool::new(false),
                 requests: Mutex::new(Vec::new()),
@@ -410,11 +410,9 @@ mod tests {
             _a: &str,
             _container: &str,
         ) -> Result<Option<TaskStatus>> {
-            if self
-                .missing
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            let mut missing = self.missing.lock().unwrap();
+            if *missing > 0 {
+                *missing -= 1;
                 return Ok(None);
             }
             let mut q = self.statuses.lock().unwrap();
@@ -474,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn start_keeps_polling_while_task_is_missing() {
         let fake = FakeEcs::new(vec![status("RUNNING", None)]);
-        fake.missing.store(2, Ordering::SeqCst);
+        *fake.missing.lock().unwrap() = 2;
         let launcher = FargateLauncher::with_client(Box::new(fake), cfg());
         let handle = launcher.start(&spec()).await.unwrap();
         assert_eq!(handle.id, "arn:task/1");
