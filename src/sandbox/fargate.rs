@@ -261,22 +261,20 @@ impl Launcher for FargateLauncher {
                     spec.start_timeout.as_secs()
                 );
             }
-            let task = self
-                .describe(&arn)
-                .await?
-                .context("worker task disappeared during startup")?;
-            match task.last_status.as_str() {
-                "RUNNING" => {
+            match self.describe(&arn).await? {
+                Some(task) if task.last_status == "RUNNING" => {
                     return Ok(Handle {
                         kind: LauncherKind::Fargate,
                         id: arn,
                     });
                 }
-                "STOPPED" => bail!(
+                Some(task) if task.last_status == "STOPPED" => bail!(
                     "worker task stopped during startup (exit {:?}, reason {:?})",
                     task.exit_code,
                     task.stopped_reason
                 ),
+                // ECS is eventually consistent: a task RunTask just returned can briefly
+                // describe as MISSING.
                 _ => {}
             }
             sleep(interval.min(deadline.saturating_duration_since(Instant::now()))).await;
@@ -333,7 +331,7 @@ impl Launcher for FargateLauncher {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn cfg() -> FargateConfig {
@@ -351,6 +349,7 @@ mod tests {
 
     struct FakeEcs {
         statuses: Mutex<VecDeque<TaskStatus>>,
+        missing: AtomicUsize,
         run_ok: bool,
         stop_called: AtomicBool,
         requests: Mutex<Vec<RunTaskRequest>>,
@@ -360,6 +359,7 @@ mod tests {
         fn new(statuses: Vec<TaskStatus>) -> Self {
             Self {
                 statuses: Mutex::new(statuses.into()),
+                missing: AtomicUsize::new(0),
                 run_ok: true,
                 stop_called: AtomicBool::new(false),
                 requests: Mutex::new(Vec::new()),
@@ -410,6 +410,13 @@ mod tests {
             _a: &str,
             _container: &str,
         ) -> Result<Option<TaskStatus>> {
+            if self
+                .missing
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Ok(None);
+            }
             let mut q = self.statuses.lock().unwrap();
             if q.len() > 1 {
                 Ok(q.pop_front())
@@ -461,6 +468,15 @@ mod tests {
         let launcher = FargateLauncher::with_client(Box::new(fake), cfg());
         let handle = launcher.start(&spec()).await.unwrap();
         assert_eq!(handle.kind, LauncherKind::Fargate);
+        assert_eq!(handle.id, "arn:task/1");
+    }
+
+    #[tokio::test]
+    async fn start_keeps_polling_while_task_is_missing() {
+        let fake = FakeEcs::new(vec![status("RUNNING", None)]);
+        fake.missing.store(2, Ordering::SeqCst);
+        let launcher = FargateLauncher::with_client(Box::new(fake), cfg());
+        let handle = launcher.start(&spec()).await.unwrap();
         assert_eq!(handle.id, "arn:task/1");
     }
 
